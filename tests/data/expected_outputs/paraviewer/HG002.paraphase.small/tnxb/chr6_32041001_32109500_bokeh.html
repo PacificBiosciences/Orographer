@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Orographer Plot</title>
+    <style>
+      html, body {
+        box-sizing: border-box;
+        display: flow-root;
+        height: 100%;
+        margin: 0;
+        padding: 0;
+      }
+    </style>
+<script src="https://cdn.bokeh.org/bokeh/release/bokeh-3.9.0.min.js"></script>
+<script src="https://cdn.bokeh.org/bokeh/release/bokeh-widgets-3.9.0.min.js"></script>
+<script>
+Bokeh.set_log_level("info");
+</script>
+  </head>
+  <body>
+    <div id="a2c8fd35-815b-4469-abe2-4ee12a3a4718" data-root-id="p1318" style="display: contents;"></div>
+  
+    
+    <script>
+      (function() {
+        const fn = function() {
+          Bokeh.safely(function() {
+            (function(root) {
+              function embed_document(root) {
+              // Load JSON data from external .json.gz file and decompress in browser
+const jsonFile = "chr6_32041001_32109500_bokeh.json.gz?v=1774040311";
+const headerBreakpoint = 825;
+const centerOffsetWide = 20;
+const centerOffsetNarrow = 0;
+const centerOffsetFullWidthAt = 1500;
+
+function getScaledCenterOffset(windowWidth) {
+    if (windowWidth <= headerBreakpoint) return centerOffsetNarrow;
+    if (windowWidth >= centerOffsetFullWidthAt) return centerOffsetWide;
+    const span = centerOffsetFullWidthAt - headerBreakpoint;
+    const ratio = (windowWidth - headerBreakpoint) / span;
+    return Math.round(centerOffsetNarrow + ratio * (centerOffsetWide - centerOffsetNarrow));
+}
+
+function updateResponsiveHeaderByModel() {
+    if (!root || !root.Bokeh || !root.Bokeh.documents) return false;
+    const docs = root.Bokeh.documents;
+    const useWide = window.innerWidth > headerBreakpoint;
+    for (let i = 0; i < docs.length; i++) {
+        const doc = docs[i];
+        const wide = doc.get_model_by_name("orographer_original_region_wide");
+        const narrow = doc.get_model_by_name("orographer_original_region_narrow_row");
+        const centerOffsetSpacer = doc.get_model_by_name("orographer_center_offset_spacer");
+        if (wide && narrow && centerOffsetSpacer) {
+            wide.visible = useWide;
+            narrow.visible = !useWide;
+            centerOffsetSpacer.width = getScaledCenterOffset(window.innerWidth);
+            wide.change.emit();
+            narrow.change.emit();
+            centerOffsetSpacer.change.emit();
+            return true;
+        }
+    }
+    return false;
+}
+
+(async function () {
+    try {
+        const response = await fetch(jsonFile);
+        if (!response.ok) {
+            throw new Error(
+                "Failed to load JSON file: " + response.status + " " + response.statusText
+            );
+        }
+        const stream = response.body.pipeThrough(new DecompressionStream("gzip"));
+        const streamResponse = await new Response(stream);
+        const data = await streamResponse.json();
+        const docs_json = data.docs_json;
+        const render_items = data.render_items;
+        root.Bokeh.embed.embed_items(docs_json, render_items);
+        let tries = 0;
+        const maxTries = 80;
+        function tryUpdateHeader() {
+            tries += 1;
+            if (updateResponsiveHeaderByModel()) return;
+            if (tries < maxTries) setTimeout(tryUpdateHeader, 100);
+        }
+        setTimeout(tryUpdateHeader, 200);
+        window.addEventListener("resize", function () {
+            updateResponsiveHeaderByModel();
+        });
+    } catch (error) {
+        const errorDiv = document.createElement("div");
+        errorDiv.style.cssText =
+            "position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); " +
+            "background: #f44336; color: white; padding: 20px; border-radius: 5px; " +
+            "z-index: 10000; font-family: Arial, sans-serif; max-width: 500px;";
+        errorDiv.innerHTML =
+            "<h3 style=\"margin-top: 0;\">Error Loading Plot Data</h3>" +
+            "<p style=\"margin: 10px 0;\">" + error.message + "</p>" +
+            "<p style=\"font-size: 12px; margin-top: 10px;\">" +
+            "Make sure you are serving files from a web server (not opening file:// directly).</p>" +
+            "<p style=\"font-size: 12px;\">Try: <code>orographer deploy --output-dir ./output</code> " +
+            "or any static file server.</p>" +
+            "<p style=\"font-size: 12px; margin-top: 10px;\">" +
+            "Then open: <code>http://localhost:8000/chr6_32041001_32109500_bokeh.html</code></p>";
+        document.body.appendChild(errorDiv);
+        console.error("Error loading JSON:", error);
+    }
+})();
+
+
+              }
+              if (root.Bokeh !== undefined) {
+                embed_document(root);
+              } else {
+                let attempts = 0;
+                const timer = setInterval(function(root) {
+                  if (root.Bokeh !== undefined) {
+                    clearInterval(timer);
+                    embed_document(root);
+                  } else {
+                    attempts++;
+                    if (attempts > 100) {
+                      clearInterval(timer);
+                      console.log("Bokeh: ERROR: Unable to run BokehJS code because BokehJS library is missing");
+                    }
+                  }
+                }, 10, root)
+              }
+            })(window);
+          });
+        };
+        if (document.readyState != "loading") fn();
+        else document.addEventListener("DOMContentLoaded", fn);
+      })();
+    </script>
+  
+    <!-- Modal for details (alignments and variants) -->
+    <div id="alignmentModal" style="display:none;position:fixed;z-index:1000;left:0;top:0;width:100%;height:100%;overflow:auto;background-color:rgba(0,0,0,0.4);align-items:center;justify-content:center;">
+        <div id="alignmentModalWrapper" style="display:flex;align-items:center;justify-content:center;max-height:90vh;">
+            <div id="alignmentModalDialog" style="background:#fefefe;padding:20px;border:1px solid #888;width:400px;">
+                <span id="closeModal" style="color:#aaa;float:right;font-size:28px;font-weight:bold;cursor:pointer;">&times;</span>
+                <h2 style="margin-top: 0; color: #333;">Details</h2>
+                <div id="modalContent" style="font-size: 14px; line-height: 1.8;"></div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+    // Modal close handlers and fitAlignmentModalToPlot
+const modal = document.getElementById("alignmentModal");
+const closeBtn = document.getElementById("closeModal");
+window.fitAlignmentModalToPlot = function () {
+    const wrapper = document.getElementById("alignmentModalWrapper");
+    const dialog = document.getElementById("alignmentModalDialog");
+    const root = document.querySelector(".bk-root");
+    if (!wrapper || !dialog) return;
+    const maxH = root
+        ? Math.max(120, 0.9 * root.getBoundingClientRect().height)
+        : 0.9 * window.innerHeight;
+    dialog.style.maxHeight = "";
+    dialog.style.transform = "";
+    const naturalH = dialog.scrollHeight;
+    const naturalW = dialog.offsetWidth || 400;
+    if (naturalH > maxH) {
+        if (maxH > 0) {
+            const scale = maxH / naturalH;
+            dialog.style.transform = "scale(" + scale + ")";
+            dialog.style.transformOrigin = "top left";
+            wrapper.style.width = naturalW * scale + "px";
+            wrapper.style.height = naturalH * scale + "px";
+            wrapper.style.overflow = "hidden";
+        }
+    } else {
+        dialog.style.transformOrigin = "";
+        wrapper.style.width = "";
+        wrapper.style.height = "";
+        wrapper.style.overflow = "";
+    }
+};
+if (closeBtn) closeBtn.onclick = function () { modal.style.display = "none"; };
+window.onclick = function (e) {
+    if (e.target === modal) modal.style.display = "none";
+};
+document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") modal.style.display = "none";
+});
+
+    </script>
+    </body>
+</html>
