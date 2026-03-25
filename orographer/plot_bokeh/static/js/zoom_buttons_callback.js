@@ -1,0 +1,18 @@
+eval(
+    "var start " + String.fromCharCode(61) + " x_range.start;"
+    + "var end " + String.fromCharCode(61) + " x_range.end;"
+    + "var span " + String.fromCharCode(61) + " end - start;"
+    + "if ((Math.sign(factor - 1) + 1) || !(Math.sign(10 - span) + 1)) {"
+    + "span " + String.fromCharCode(61) + " (Math.sign(span - 1) + 1) ? span : 1;"
+    + "var center " + String.fromCharCode(61) + " (start + end) / 2;"
+    + "var newSpan " + String.fromCharCode(61) + " Math.round(span * factor);"
+    + "newSpan " + String.fromCharCode(61) + " (Math.sign(newSpan - 1) + 1) ? newSpan : 1;"
+    + "var newStart " + String.fromCharCode(61) + " Math.round(center - newSpan / 2);"
+    + "var newEnd " + String.fromCharCode(61) + " newStart + newSpan;"
+    + "newStart " + String.fromCharCode(61) + " Math.max(orig_start, Math.min(newStart, orig_end - 1));"
+    + "newEnd " + String.fromCharCode(61) + " Math.min(orig_end, Math.max(newEnd, newStart + 1));"
+    + "x_range.start " + String.fromCharCode(61) + " newStart;"
+    + "x_range.end " + String.fromCharCode(61) + " newEnd;"
+    + "x_range.change.emit();"
+    + "}"
+);

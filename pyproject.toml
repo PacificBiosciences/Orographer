@@ -1,0 +1,114 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "orographer"
+version = "0.1.0"
+description = "command line tool for visualizing split alignments from BAM files"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [
+    { name = "Jonathan Belyeu", email = "jbelyeu@pacificbiosciences.com" }
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "License :: Other/Proprietary License",
+]
+dependencies = [
+    "pysam>=0.23.0",
+    "matplotlib>=3.8.4",
+    "plotly>=5.0.0",
+    "bokeh>=3.0.0",
+    "intervaltree>=3.1.0",
+]
+
+[project.optional-dependencies]
+# End-to-end shell script (tests/scripts/run_end_to_end_tests.sh): CPython venv + pytest +
+# ruff (lint/format gate) + tests/scripts/compare_files.py (pysam + skimage for HTML SSIM).
+e2e = [
+    "pytest>=8.3,<9",
+    "ruff>=0.8",
+    "scikit-image>=0.22",
+]
+dev = [
+    "pytest==8.3.5",
+    "pytest-cov",
+    "black",
+    "isort",
+    "mypy",
+    "ruff",
+    "pre-commit",
+]
+
+[project.scripts]
+orographer = "orographer.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["orographer"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "orographer",
+    "LICENSE.md",
+    "README.md",
+]
+
+[tool.hatch.envs.default]
+dependencies = [
+    "pytest",
+    "pytest-cov",
+]
+
+[tool.hatch.envs.default.scripts]
+test = "pytest {args:tests}"
+test-cov = "pytest --cov-report=term-missing --cov-config=pyproject.toml --cov=orographer {args:tests}"
+lint = [
+    "ruff check .",
+    "ruff format --check .",
+    "black --check .",
+    "isort --check-only .",
+    "mypy .",
+]
+format = [
+    "ruff check --fix .",
+    "ruff format .",
+    "black .",
+    "isort .",
+]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "C4", "SIM", "RUF"]
+ignore = []
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra -q"
+markers = [
+    "slow: slow integration tests (e.g., deploy smoke tests)",
+]
