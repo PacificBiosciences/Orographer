@@ -1,6 +1,6 @@
 # Orographer
 
-**Orographer is in a pre-release status for feedback only. It is currently intended only for use with [paraviewr](https://github.com/PacificBiosciences/Paraviewer)**
+**Orographer is in a pre-release status for feedback only. It is currently intended only for use with [paraviewer](https://github.com/PacificBiosciences/Paraviewer)**
 
 ## Interactive alignment plots from BAM and coordinates
 
