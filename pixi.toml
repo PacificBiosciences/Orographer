@@ -1,0 +1,19 @@
+[workspace]
+name = "orographer"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+nodejs = ">=20,<23"
+pip = ">=24"
+python = ">=3.10,<3.12"
+
+[pypi-dependencies]
+orographer = { path = ".", editable = true, extras = ["e2e"] }
+
+[tasks]
+unit-tests = "tests/scripts/run_unit_tests.sh"
+python-unit-tests = "python -m pytest tests/unit"
+browser-tests = "tests/scripts/run_browser_tests.sh"
+install-browsers = "playwright install chromium firefox webkit"
+ruff = "ruff check ."

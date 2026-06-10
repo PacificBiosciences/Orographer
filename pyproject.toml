@@ -21,18 +21,23 @@ classifiers = [
 dependencies = [
     "bokeh>=3.0.0",
     "intervaltree>=3.1.0",
-    "pysam>=0.23.0",
+    "matplotlib>=3.7.0",
+    "numpy>=1.24.0",
+    "pysam>=0.24.0",
 ]
 
 [project.optional-dependencies]
 # End-to-end shell script (tests/scripts/run_end_to_end_tests.sh): CPython venv + pytest +
 # ruff (lint/format gate) + tests/scripts/compare_files.py (pysam + skimage for HTML SSIM).
 e2e = [
+    "playwright>=1.45",
     "pytest>=8.3,<9",
+    "pytest-cov>=5.0",
     "ruff>=0.8",
     "scikit-image>=0.22",
 ]
 dev = [
+    "playwright",
     "pytest==8.3.5",
     "pytest-cov",
     "black",
@@ -108,5 +113,6 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-ra -q"
 markers = [
+    "browser: browser tests that require Playwright and installed browser binaries",
     "slow: slow integration tests (e.g., deploy smoke tests)",
 ]
