@@ -62,6 +62,56 @@ function source(data, indices = []) {
     };
 }
 
+test("embed loader expands compact orographer JSON encodings", () => {
+    const context = {
+        __CENTER_OFFSET_WIDE__: 48,
+        fetch() {
+            return new Promise(function () {});
+        },
+        root: {},
+        window: {
+            innerWidth: 1200,
+            addEventListener() {},
+        },
+        Array,
+        Error,
+        Math,
+        Object,
+        Promise,
+        Response,
+        String,
+        console,
+        DecompressionStream: function DecompressionStream() {},
+    };
+
+    runCallback("embed_replace.js", context);
+
+    const compact = {
+        read_name: {
+            __orog_dict__: {
+                values: ["readA", "readB"],
+                indices: [0, 1, 0, 1],
+            },
+        },
+        x: { __orog_range__: [100, 5, 4] },
+        y: { __orog_rle__: [[0, 2], [1, 2]] },
+        xs: { __orog_repeat__: [{ __orog_range__: [100, 5, 4] }, 2] },
+    };
+
+    const expanded = context.expandOrographerCompact(compact);
+
+    assert.deepEqual(plain(expanded), {
+        read_name: ["readA", "readB", "readA", "readB"],
+        x: [100, 105, 110, 115],
+        y: [0, 0, 1, 1],
+        xs: [
+            [100, 105, 110, 115],
+            [100, 105, 110, 115],
+        ],
+    });
+    assert.notEqual(expanded.xs[0], expanded.xs[1]);
+});
+
 function fakeElement(tagName, text = "") {
     const element = {
         tagName,

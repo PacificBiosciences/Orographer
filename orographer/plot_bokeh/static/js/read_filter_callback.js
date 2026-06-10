@@ -1,5 +1,7 @@
 function readFilterSources() {
-    const sources = read_filter_sources || [];
+    const configuredSources =
+        typeof read_filter_sources === "undefined" ? null : read_filter_sources;
+    const sources = configuredSources || discoveredReadFilterSources();
     const uniqueSources = [];
     const seen = new Set();
     sources.forEach(function (source) {
@@ -18,6 +20,30 @@ function readFilterSources() {
     return uniqueSources;
 }
 
+function discoveredReadFilterSources() {
+    const discovered = [];
+    const bokeh = window.Bokeh || null;
+    const docs = bokeh ? bokeh.documents || [] : [];
+    docs.forEach(function (doc) {
+        const models = doc._all_models;
+        if (!models) {
+            return;
+        }
+        models.forEach(function (model) {
+            if (!model) {
+                return;
+            }
+            if (!model.data) {
+                return;
+            }
+            if (model.data.read_filter_alpha || model.data.label_alpha) {
+                discovered.push(model);
+            }
+        });
+    });
+    return discovered;
+}
+
 function readFilterLayoutMode() {
     if (hide_non_split_checkbox.active) {
         return hide_non_multiregion_checkbox.active ? "split_multiregion" : "split";
@@ -27,10 +53,23 @@ function readFilterLayoutMode() {
 
 function readFilterVisibility(data, rowIndex, layoutMode) {
     const columnName = "read_filter_visible_" + layoutMode;
-    if (!data[columnName]) {
-        return 1;
+    if (data[columnName]) {
+        return data[columnName][rowIndex] ? 1 : 0;
     }
-    return data[columnName][rowIndex] ? 1 : 0;
+    const hasSplit = data.has_split_alignment ? data.has_split_alignment[rowIndex] : true;
+    const hasMultiregion = data.has_multiregion_connection
+        ? data.has_multiregion_connection[rowIndex]
+        : true;
+    if (layoutMode == "split") {
+        return hasSplit ? 1 : 0;
+    }
+    if (layoutMode == "multiregion") {
+        return hasMultiregion ? 1 : 0;
+    }
+    if (layoutMode == "split_multiregion") {
+        return hasSplit ? (hasMultiregion ? 1 : 0) : 0;
+    }
+    return 1;
 }
 
 function updateAlphaColumn(data, columnName, visibleValue, layoutMode) {
@@ -132,11 +171,13 @@ function selectedReadNames(sources) {
 }
 
 function updateReadFilterYRanges(layoutMode) {
-    if (!read_filter_y_ranges) {
+    const yRanges = typeof read_filter_y_ranges === "undefined" ? null : read_filter_y_ranges;
+    const yBounds = typeof read_filter_y_bounds === "undefined" ? null : read_filter_y_bounds;
+    if (!yRanges) {
         return;
     }
-    read_filter_y_ranges.forEach(function (yRange, rangeIndex) {
-        const boundsByMode = read_filter_y_bounds ? read_filter_y_bounds[rangeIndex] : null;
+    yRanges.forEach(function (yRange, rangeIndex) {
+        const boundsByMode = yBounds ? yBounds[rangeIndex] : null;
         if (!boundsByMode) {
             return;
         }

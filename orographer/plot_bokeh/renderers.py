@@ -151,6 +151,7 @@ def _add_insertion_markers(plot_figure: Any, insertion_data: dict, renderers: di
             continue
         sub = {key: [value[idx] for idx in idx_list] for key, value in insertion_data.items()}
         sub.pop("is_1bp", None)
+        sub["text"] = [f"{count}I" for count in sub["count"]]
         add_read_filter_visibility_columns(sub)
         sub_source = ColumnDataSource(data=sub)
         renderers["sources"].append(sub_source)
@@ -170,28 +171,11 @@ def _add_insertion_markers(plot_figure: Any, insertion_data: dict, renderers: di
         if is_one_bp:
             renderers["one_bp"].append(marker)
             renderers["one_bp_markers"].append(marker)
-        text_data = {
-            "x": sub["x"],
-            "y": sub["y"],
-            "text": [f"{sub['count'][idx]}I" for idx in range(len(sub["x"]))],
-            "text_alpha": sub["text_alpha"],
-            "read_filter_alpha": sub["read_filter_alpha"],
-            "has_split_alignment": sub["has_split_alignment"],
-            "has_multiregion_connection": sub["has_multiregion_connection"],
-            "read_name": sub.get("read_name", [""] * len(sub["x"])),
-            "layout_read_name": sub.get("layout_read_name", [""] * len(sub["x"])),
-        }
-        for key, value in sub.items():
-            if key.startswith("y_"):
-                text_data[key] = value
-        add_read_filter_visibility_columns(text_data)
-        text_source = ColumnDataSource(data=text_data)
-        renderers["sources"].append(text_source)
         text = plot_figure.text(
             x="x",
             y="y",
             text="text",
-            source=text_source,
+            source=sub_source,
             text_font_size=PLOT_CONFIG["insertion_text_font_size"],
             text_color=insertion_color,
             text_alpha="text_alpha",

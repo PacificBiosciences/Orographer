@@ -11,6 +11,7 @@ from bokeh.models import ColumnDataSource, CustomJS, Div, HoverTool, Range1d, Ta
 from bokeh.plotting import figure
 
 from orographer.plot_bokeh import plot_bokeh
+from orographer.plot_bokeh.callbacks import compact_bokeh_json, expand_compact_bokeh_json
 from orographer.utils import (
     COMPLEX_SV_REGION_TYPE,
     PARAPHASE_REGION_TYPE,
@@ -56,6 +57,23 @@ def segment(
         deletions=deletions or [],
         aligned_blocks=aligned_blocks or [(pos, end)],
     )
+
+
+def test_compact_bokeh_json_round_trips_common_bokeh_columns() -> None:
+    payload = {
+        "read_name": ["readA"] * 20 + ["readB"] * 20,
+        "layout_read_name": ["readA", "readB"] * 20,
+        "x": list(range(100, 260, 4)),
+        "y": [0] * 12 + [1] * 14 + [2] * 14,
+        "xs": [list(range(100, 260, 4))] * 8,
+    }
+
+    compacted = compact_bokeh_json(payload)
+
+    assert expand_compact_bokeh_json(compacted) == payload
+    assert "__orog_dict__" in json.dumps(compacted)
+    assert "__orog_range__" in json.dumps(compacted)
+    assert "__orog_repeat__" in json.dumps(compacted)
 
 
 def test_get_segment_color_prefers_valid_yc_tag() -> None:

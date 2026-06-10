@@ -11,6 +11,8 @@ from __future__ import annotations
 from contextlib import suppress
 from typing import Any
 
+from orographer.plot_bokeh.callbacks import expand_compact_bokeh_json
+
 # Ignore small numeric ranges (y axes, padding, etc.)
 _MIN_GENOMIC_LIKE = 50_000
 
@@ -59,6 +61,7 @@ def collect_genomic_like_start_end_pairs(
     usual genomic magnitude floor (for testing small loci without weakening
     filtering for unrelated small numeric ranges).
     """
+    obj = expand_compact_bokeh_json(obj)
     always = always_include_ranges or set()
     out: set[tuple[int, int]] = set()
 
@@ -101,6 +104,7 @@ def collect_orig_region_bounds_from_docs_json(docs_json: dict[str, Any]) -> list
     Orographer passes these for coord / zoom callbacks; they match the plotted
     1-based inclusive region bounds regardless of axis padding heuristics.
     """
+    docs_json = expand_compact_bokeh_json(docs_json)
     found: list[tuple[int, int]] = []
 
     def walk(o: Any) -> None:
@@ -171,6 +175,7 @@ def assert_sample_labels_in_docs_json(docs_json: dict[str, Any], labels: list[st
     """
     if not labels:
         raise AssertionError("labels must be non-empty")
+    docs_json = expand_compact_bokeh_json(docs_json)
     div_ok = dict.fromkeys(labels, False)
     cds_hits: set[str] = set()
 

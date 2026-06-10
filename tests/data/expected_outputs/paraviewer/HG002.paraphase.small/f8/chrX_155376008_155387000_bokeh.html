@@ -19,7 +19,7 @@ Bokeh.set_log_level("info");
 </script>
   </head>
   <body>
-    <div id="a771096f-f407-4473-8c50-cd861d00e85e" data-root-id="p1334" style="display: contents;"></div>
+    <div id="da3ca832-4838-4a2f-b650-c9b08dd718ea" data-root-id="p1328" style="display: contents;"></div>
   
     
     <script>
@@ -29,11 +29,85 @@ Bokeh.set_log_level("info");
             (function(root) {
               function embed_document(root) {
               // Load JSON data from external .json.gz file and decompress in browser
-const jsonFile = "chrX_155376008_155387000_bokeh.json.gz?v=1781130218";
+const jsonFile = "chrX_155376008_155387000_bokeh.json.gz?v=1781132777";
 const headerBreakpoint = 825;
 const centerOffsetWide = 20;
 const centerOffsetNarrow = 0;
 const centerOffsetFullWidthAt = 1500;
+const compactRepeatKey = "__orog_repeat__";
+const compactDictKey = "__orog_dict__";
+const compactRangeKey = "__orog_range__";
+const compactRleKey = "__orog_rle__";
+
+function hasOwn(objectValue, key) {
+    return Object.prototype.hasOwnProperty.call(objectValue, key);
+}
+
+function expandCompactRepeat(encoded) {
+    const compactValue = encoded[0];
+    const count = encoded[1];
+    const expanded = [];
+    for (let index = 0; index < count; index += 1) {
+        expanded.push(expandOrographerCompact(compactValue));
+    }
+    return expanded;
+}
+
+function expandCompactDict(encoded) {
+    const values = expandOrographerCompact(encoded.values);
+    const indices = expandOrographerCompact(encoded.indices);
+    const expanded = [];
+    for (let index = 0; index < indices.length; index += 1) {
+        expanded.push(values[indices[index]]);
+    }
+    return expanded;
+}
+
+function expandCompactRange(encoded) {
+    const start = encoded[0];
+    const step = encoded[1];
+    const count = encoded[2];
+    const expanded = [];
+    for (let index = 0; index < count; index += 1) {
+        expanded.push(start + step * index);
+    }
+    return expanded;
+}
+
+function expandCompactRle(encoded) {
+    const expanded = [];
+    for (let runIndex = 0; runIndex < encoded.length; runIndex += 1) {
+        const run = encoded[runIndex];
+        const value = expandOrographerCompact(run[0]);
+        const count = run[1];
+        for (let index = 0; index < count; index += 1) {
+            expanded.push(value);
+        }
+    }
+    return expanded;
+}
+
+function expandOrographerCompact(value) {
+    if (Array.isArray(value)) {
+        const expanded = [];
+        for (let index = 0; index < value.length; index += 1) {
+            expanded.push(expandOrographerCompact(value[index]));
+        }
+        return expanded;
+    }
+    if (!value || typeof value !== "object") return value;
+    if (hasOwn(value, compactRepeatKey)) return expandCompactRepeat(value[compactRepeatKey]);
+    if (hasOwn(value, compactDictKey)) return expandCompactDict(value[compactDictKey]);
+    if (hasOwn(value, compactRangeKey)) return expandCompactRange(value[compactRangeKey]);
+    if (hasOwn(value, compactRleKey)) return expandCompactRle(value[compactRleKey]);
+    const expanded = {};
+    const keys = Object.keys(value);
+    for (let index = 0; index < keys.length; index += 1) {
+        const key = keys[index];
+        expanded[key] = expandOrographerCompact(value[key]);
+    }
+    return expanded;
+}
 
 function getScaledCenterOffset(windowWidth) {
     if (windowWidth <= headerBreakpoint) return centerOffsetNarrow;
@@ -75,7 +149,7 @@ function updateResponsiveHeaderByModel() {
         }
         const stream = response.body.pipeThrough(new DecompressionStream("gzip"));
         const streamResponse = await new Response(stream);
-        const data = await streamResponse.json();
+        const data = expandOrographerCompact(await streamResponse.json());
         const docs_json = data.docs_json;
         const render_items = data.render_items;
         root.Bokeh.embed.embed_items(docs_json, render_items);
@@ -100,7 +174,8 @@ function updateResponsiveHeaderByModel() {
             "<h3 style=\"margin-top: 0;\">Error Loading Plot Data</h3>" +
             "<p style=\"margin: 10px 0;\">" + error.message + "</p>" +
             "<p style=\"font-size: 12px; margin-top: 10px;\">" +
-            "Make sure you are serving files from a web server (not opening file:// directly).</p>" +
+            "Make sure you are serving files from a web server " +
+            "(not opening file:// directly).</p>" +
             "<p style=\"font-size: 12px;\">Try: <code>orographer deploy --outdir ./output</code> " +
             "or any static file server.</p>" +
             "<p style=\"font-size: 12px; margin-top: 10px;\">" +

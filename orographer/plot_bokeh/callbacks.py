@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import sys
+from typing import Any
 
 from bokeh.io import output_file as bokeh_output_file
 from bokeh.models import CustomJS
@@ -14,6 +15,142 @@ from bokeh.plotting import save
 from .utils import COORD_INPUT_CENTER_OFFSET_PX, load_javascript
 
 logger = logging.getLogger(__name__)
+
+COMPACT_MIN_REPEAT = 8
+COMPACT_MIN_DICT = 16
+COMPACT_MIN_RANGE = 16
+COMPACT_MIN_RLE = 16
+COMPACT_DICT_MAX_UNIQUE_RATIO = 0.8
+COMPACT_RLE_MAX_RUN_RATIO = 0.7
+COMPACT_REPEAT_KEY = "__orog_repeat__"
+COMPACT_DICT_KEY = "__orog_dict__"
+COMPACT_RANGE_KEY = "__orog_range__"
+COMPACT_RLE_KEY = "__orog_rle__"
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _is_scalar(value: Any) -> bool:
+    return value is None or isinstance(value, str | int | float | bool)
+
+
+def _json_size(value: Any) -> int:
+    return len(json.dumps(value, separators=(",", ":")))
+
+
+def _smaller_encoding(original: list[Any], encoded: dict[str, Any]) -> Any:
+    if _json_size(encoded) < _json_size(original):
+        return encoded
+    return [_compact_json_value(item) for item in original]
+
+
+def _compact_string_list(values: list[Any]) -> Any | None:
+    if len(values) < COMPACT_MIN_DICT or not all(isinstance(value, str) for value in values):
+        return None
+    unique_values = list(dict.fromkeys(values))
+    unique_ratio = len(unique_values) / len(values)
+    if unique_ratio > COMPACT_DICT_MAX_UNIQUE_RATIO:
+        return None
+    value_to_index = {value: index for index, value in enumerate(unique_values)}
+    encoded = {
+        COMPACT_DICT_KEY: {
+            "values": unique_values,
+            "indices": [value_to_index[value] for value in values],
+        }
+    }
+    return _smaller_encoding(values, encoded)
+
+
+def _compact_numeric_range(values: list[Any]) -> Any | None:
+    if len(values) < COMPACT_MIN_RANGE or not all(_is_number(value) for value in values):
+        return None
+    step = values[1] - values[0]
+    if any(values[index] - values[index - 1] != step for index in range(2, len(values))):
+        return None
+    encoded = {COMPACT_RANGE_KEY: [values[0], step, len(values)]}
+    return _smaller_encoding(values, encoded)
+
+
+def _compact_rle_list(values: list[Any]) -> Any | None:
+    if len(values) < COMPACT_MIN_RLE or not all(_is_scalar(value) for value in values):
+        return None
+    runs: list[list[Any]] = []
+    run_value = values[0]
+    run_count = 1
+    for value in values[1:]:
+        if value == run_value:
+            run_count += 1
+            continue
+        runs.append([run_value, run_count])
+        run_value = value
+        run_count = 1
+    runs.append([run_value, run_count])
+    if len(runs) / len(values) > COMPACT_RLE_MAX_RUN_RATIO:
+        return None
+    encoded = {COMPACT_RLE_KEY: runs}
+    return _smaller_encoding(values, encoded)
+
+
+def _compact_json_list(values: list[Any]) -> Any:
+    if not values:
+        return values
+    if len(values) >= COMPACT_MIN_REPEAT and all(value == values[0] for value in values):
+        encoded = {COMPACT_REPEAT_KEY: [_compact_json_value(values[0]), len(values)]}
+        return _smaller_encoding(values, encoded)
+
+    compacted: Any | None = _compact_numeric_range(values)
+    if compacted is not None:
+        return compacted
+
+    compacted = _compact_string_list(values)
+    if compacted is not None:
+        return compacted
+
+    compacted = _compact_rle_list(values)
+    if compacted is not None:
+        return compacted
+
+    return [_compact_json_value(item) for item in values]
+
+
+def _compact_json_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return _compact_json_list(value)
+    if isinstance(value, dict):
+        return {key: _compact_json_value(item) for key, item in value.items()}
+    return value
+
+
+def compact_bokeh_json(value: Any) -> Any:
+    """Compact repeated Bokeh JSON arrays before writing external plot data."""
+    return _compact_json_value(value)
+
+
+def expand_compact_bokeh_json(value: Any) -> Any:
+    """Expand Orographer's compact Bokeh JSON encodings."""
+    if isinstance(value, list):
+        return [expand_compact_bokeh_json(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    if COMPACT_REPEAT_KEY in value:
+        repeated_value, count = value[COMPACT_REPEAT_KEY]
+        return [expand_compact_bokeh_json(repeated_value) for _ in range(count)]
+    if COMPACT_DICT_KEY in value:
+        payload = value[COMPACT_DICT_KEY]
+        values = expand_compact_bokeh_json(payload["values"])
+        indices = expand_compact_bokeh_json(payload["indices"])
+        return [values[index] for index in indices]
+    if COMPACT_RANGE_KEY in value:
+        start, step, count = value[COMPACT_RANGE_KEY]
+        return [start + step * index for index in range(count)]
+    if COMPACT_RLE_KEY in value:
+        expanded = []
+        for run_value, count in value[COMPACT_RLE_KEY]:
+            expanded.extend([expand_compact_bokeh_json(run_value)] * count)
+        return expanded
+    return {key: expand_compact_bokeh_json(item) for key, item in value.items()}
 
 
 def get_exon_click_callback(source):
@@ -150,9 +287,9 @@ def save_plot_with_modal(layout, output_file, prefix):
         return
 
     json_file = os.path.splitext(output_file)[0] + ".json.gz"
-    json_data = {"docs_json": docs_json, "render_items": render_items}
+    json_data = compact_bokeh_json({"docs_json": docs_json, "render_items": render_items})
     with gzip.open(json_file, "wt", encoding="utf-8") as f:
-        json.dump(json_data, f)
+        json.dump(json_data, f, separators=(",", ":"))
 
     json_filename = os.path.basename(json_file)
     # Prevent stale JSON cache from mismatching newly generated HTML root IDs.
