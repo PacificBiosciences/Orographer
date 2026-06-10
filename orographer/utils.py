@@ -7,9 +7,19 @@ from typing import NamedTuple
 logger = logging.getLogger(__name__)
 
 COMPLEX_SV_REGION_TYPE = "complex_sv"
+ISOSEQ_REGION_TYPE = "isoseq"
 PARAPHASE_REGION_TYPE = "paraphase"
 
-ALLOWED_REGION_TYPES = [COMPLEX_SV_REGION_TYPE, PARAPHASE_REGION_TYPE]
+PUBLIC_REGION_TYPES = [PARAPHASE_REGION_TYPE]
+EXPERIMENTAL_REGION_TYPES = [COMPLEX_SV_REGION_TYPE, ISOSEQ_REGION_TYPE]
+ALLOWED_REGION_TYPES = PUBLIC_REGION_TYPES
+
+
+def get_allowed_region_types(include_experimental: bool = False) -> list[str]:
+    """Return CLI-visible region types, optionally including hidden experimental modes."""
+    if include_experimental:
+        return [*PUBLIC_REGION_TYPES, *EXPERIMENTAL_REGION_TYPES]
+    return list(PUBLIC_REGION_TYPES)
 
 
 class Region(NamedTuple):
@@ -35,6 +45,7 @@ class OutputConfig(NamedTuple):
 
     output_dir: str
     prefix: str | None
+    filename_regions: list[str] | None = None
 
 
 def get_tabix_chromosome_name(tabix_file, target_chrom: str) -> str | None:
@@ -123,8 +134,8 @@ def parse_coordinate(coord_string):
     Raises:
         ValueError: If coordinate format is invalid
     """
-    # Pattern to match chrom:start-end format
-    pattern = r"^([^:]+):(\d+)-(\d+)$"
+    # Accept comma-formatted coordinates while keeping internal values numeric.
+    pattern = r"^([^:]+):([0-9][0-9,]*)-([0-9][0-9,]*)$"
     match = re.match(pattern, coord_string)
 
     if not match:
@@ -133,11 +144,27 @@ def parse_coordinate(coord_string):
         )
 
     chromosome = match.group(1)
-    start = int(match.group(2))
-    end = int(match.group(3))
+    start = int(match.group(2).replace(",", ""))
+    end = int(match.group(3).replace(",", ""))
 
     # Validate that start < end
     if start >= end:
         raise ValueError(f"Start position ({start}) must be less than end position ({end})")
 
     return chromosome, start, end
+
+
+def chromosome_sort_key(chromosome: str) -> tuple[int, int, str]:
+    """Return a natural chromosome sort key with numbered chromosomes first."""
+    normalized = chromosome.lower()
+    if normalized.startswith("chr"):
+        normalized = normalized[3:]
+
+    if normalized.isdigit():
+        return 0, int(normalized), ""
+
+    special_order = {"x": 23, "y": 24, "m": 25, "mt": 25}
+    if normalized in special_order:
+        return 0, special_order[normalized], ""
+
+    return 1, 0, normalized

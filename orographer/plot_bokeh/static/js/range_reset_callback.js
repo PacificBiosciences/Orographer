@@ -12,3 +12,11 @@ all_sources.forEach(function (source) {
     }
     source.change.emit();
 });
+if (typeof window !== "undefined") {
+    if (window.orographerApplyReadFilter) {
+        window.orographerApplyReadFilter();
+    }
+    if (window.orographerUpdateReadConnectionOverlay) {
+        window.orographerUpdateReadConnectionOverlay();
+    }
+}

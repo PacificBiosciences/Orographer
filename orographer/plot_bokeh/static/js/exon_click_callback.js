@@ -19,6 +19,8 @@ const cdsText = function (col, idx) {
 const geneName = cdsText(data.gene_name, clickedIdx);
 const strand = cdsText(data.gene_strand, clickedIdx);
 const exonNumber = cdsText(data.exon_number, clickedIdx);
+const representativeTranscript = cdsText(data.representative_transcript, clickedIdx);
+const representativeMethod = cdsText(data.representative_selection_method, clickedIdx);
 
 const modal = document.getElementById("alignmentModal");
 const modalContent = document.getElementById("modalContent");
@@ -34,6 +36,10 @@ html += LT + "p" + GT + LT + "strong" + GT + "Transcript Strand:" + LT + "/stron
     + LT + "br" + GT + strand + LT + "/p" + GT;
 html += LT + "p" + GT + LT + "strong" + GT + "Exon Number:" + LT + "/strong" + GT
     + LT + "br" + GT + exonNumber + LT + "/p" + GT;
+html += LT + "p" + GT + LT + "strong" + GT + "Representative Transcript:" + LT
+    + "/strong" + GT + LT + "br" + GT + representativeTranscript + LT + "/p" + GT;
+html += LT + "p" + GT + LT + "strong" + GT + "Selection Method:" + LT + "/strong" + GT
+    + LT + "br" + GT + representativeMethod + LT + "/p" + GT;
 modalContent.innerHTML = html;
 if (window.fitAlignmentModalToPlot) window.fitAlignmentModalToPlot();
 modal.style.display = "flex";

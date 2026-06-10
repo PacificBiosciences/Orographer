@@ -71,7 +71,7 @@ function updateResponsiveHeaderByModel() {
             "<p style=\"margin: 10px 0;\">" + error.message + "</p>" +
             "<p style=\"font-size: 12px; margin-top: 10px;\">" +
             "Make sure you are serving files from a web server (not opening file:// directly).</p>" +
-            "<p style=\"font-size: 12px;\">Try: <code>orographer deploy --output-dir ./output</code> " +
+            "<p style=\"font-size: 12px;\">Try: <code>orographer deploy --outdir ./output</code> " +
             "or any static file server.</p>" +
             "<p style=\"font-size: 12px; margin-top: 10px;\">" +
             "Then open: <code>http://localhost:8000/__OUTPUT_BASENAME__</code></p>";

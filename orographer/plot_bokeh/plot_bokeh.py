@@ -5,11 +5,18 @@ Orchestration and track content for Bokeh plots
 
 import logging
 import math
+import os
+from collections.abc import Mapping, Sequence
 
 from bokeh.layouts import column, row
-from bokeh.models import ColumnDataSource, CustomJS, Div, HoverTool, TapTool
+from bokeh.models import Button, ColumnDataSource, CustomJS, Div, TapTool
 
-from ..utils import PARAPHASE_REGION_TYPE
+from ..utils import COMPLEX_SV_REGION_TYPE, ISOSEQ_REGION_TYPE, PARAPHASE_REGION_TYPE
+from . import coverage as coverage_data
+from . import isoseq as isoseq_data
+from . import isoseq_store, isoseq_tracks, segment_processing
+from . import renderers as plot_renderers
+from . import sources as source_data
 from .callbacks import (
     get_arrow_tap_callback,
     get_arrow_tap_callback_multi_region,
@@ -18,65 +25,361 @@ from .callbacks import (
     save_plot_with_modal,
 )
 from .data import (
+    READ_FILTER_LAYOUT_MODES,
+    ReadFilterLayoutRequest,
+    add_read_filter_visibility_columns,
+    build_read_filter_layouts,
     calculate_read_positions,
     generate_multi_region_filename,
     sort_read_names,
 )
 from .figures import (
+    add_coverage_to_figure,
+    add_cursor_guide_callbacks,
+    add_cursor_guide_to_figures,
     add_gene_track,
     add_haplotype_labels,
+    add_insertion_markers_to_figure,
     add_separator_lines,
     create_bokeh_figure,
     create_bokeh_figure_shared_x,
     create_coordinate_display,
+    create_coverage_figure,
+    create_dotplot_thumbnail,
     create_gene_track_figure,
     create_genomic_x_axis_strip,
+    create_global_checkbox_controls,
     create_vcf_track_figure,
 )
-from .utils import PLOT_CONFIG, RegionBuildState, load_javascript
+from .lazy_store import write_json_gzip
+from .utils import (
+    PLOT_CONFIG,
+    RegionBuildState,
+    build_haplotype_color_map,
+    get_haplotype_color,
+    load_javascript,
+)
 
 logger = logging.getLogger(__name__)
 logging.getLogger("bokeh").setLevel(logging.WARNING)
 
+ISOSEQ_READ_PAGE_SIZE = isoseq_data.ISOSEQ_READ_PAGE_SIZE
+ISOSEQ_READ_SHARD_SIZE = isoseq_data.ISOSEQ_READ_SHARD_SIZE
+add_isoseq_transcripts_to_plot = isoseq_tracks.add_isoseq_transcripts_to_plot
+create_isoseq_controls = isoseq_tracks.create_isoseq_controls
+_build_isoseq_bam_row_track = isoseq_tracks.build_isoseq_bam_row_track
 
-def get_segment_color(segment, region_type):
-    """Color for a segment (YC tag or haplotype/strand; paraphase no YC -> grey)."""
-    if hasattr(segment, "color_tag") and segment.color_tag:
-        try:
-            rgb = segment.color_tag.split(",")
-            if len(rgb) == 3:
-                r, g, b = int(rgb[0]), int(rgb[1]), int(rgb[2])
-                return f"#{r:02x}{g:02x}{b:02x}"
-        except (ValueError, IndexError):
-            pass
-    # Paraphase: reads without YC tag are grey regardless of strand
-    if region_type == PARAPHASE_REGION_TYPE:
-        return PLOT_CONFIG["segment_paraphase_color"]
-    haplotype = segment.haplotype_tag
-    if haplotype is None or haplotype == 0:
-        return PLOT_CONFIG["segment_unassigned_color"]
-    return (
-        PLOT_CONFIG["segment_fwd_color"]
-        if segment.is_fwd_strand
-        else PLOT_CONFIG["segment_rev_color"]
+get_segment_color = segment_processing.get_segment_color
+format_alignment_coordinates = segment_processing.format_alignment_coordinates
+get_base_color = segment_processing.get_base_color
+get_vcf_variant_color = segment_processing.get_vcf_variant_color
+connection_key = segment_processing.connection_key
+segment_overlaps_region = segment_processing.segment_overlaps_region
+alignment_identity = segment_processing.alignment_identity
+alignment_order_sort_key = segment_processing.alignment_order_sort_key
+assign_region_agnostic_alignment_orders = segment_processing.assign_region_agnostic_alignment_orders
+haplotype_label_for_segment = segment_processing.haplotype_label_for_segment
+connection_id_for_entries = segment_processing.connection_id_for_entries
+build_read_connection_index = segment_processing.build_read_connection_index
+build_read_alignment_summaries = segment_processing.build_read_alignment_summaries
+connection_target_metadata = segment_processing.connection_target_metadata
+connection_metadata_for_segment = segment_processing.connection_metadata_for_segment
+read_filter_flags = segment_processing.read_filter_flags
+connector_endpoint_y = segment_processing.connector_endpoint_y
+double_connected_read_min_height = segment_processing.double_connected_read_min_height
+connector_offset_min_heights_by_read = segment_processing.connector_offset_min_heights_by_read
+add_connector_rows = segment_processing.add_connector_rows
+empty_same_region_connector_data = segment_processing.empty_same_region_connector_data
+connector_lane_spacing = segment_processing.connector_lane_spacing
+intervals_overlap = segment_processing.intervals_overlap
+point_between = segment_processing.point_between
+connector_candidate_lanes = segment_processing.connector_candidate_lanes
+connector_lane_cost = segment_processing.connector_lane_cost
+route_same_region_connectors = segment_processing.route_same_region_connectors
+add_same_region_connector_lines = segment_processing.add_same_region_connector_lines
+process_segments = segment_processing.process_segments
+
+
+def _layout_mode_column(column_name: str, mode: str) -> str:
+    """Return the alternate source-column name for a read filter layout mode."""
+    return f"{column_name}_{mode}"
+
+
+def _read_filter_flags_by_layout_read(
+    segments_by_read: Mapping[str, Sequence[object]],
+    row_index: int,
+    alignment_summaries: Mapping[tuple[int, str], Sequence[Mapping[str, object]]] | None,
+) -> dict[str, tuple[bool, bool]]:
+    """Return split and multiregion evidence flags keyed by displayed read name."""
+    flags_by_read: dict[str, tuple[bool, bool]] = {}
+    for display_read_name, segments in segments_by_read.items():
+        has_split = False
+        has_multiregion = False
+        for segment in segments:
+            segment_read_name = getattr(segment, "readname", display_read_name)
+            segment_split, segment_multiregion = read_filter_flags(
+                alignment_summaries,
+                row_index,
+                str(segment_read_name),
+            )
+            has_split = has_split or segment_split
+            has_multiregion = has_multiregion or segment_multiregion
+        flags_by_read[display_read_name] = (has_split, has_multiregion)
+    return flags_by_read
+
+
+def _build_read_filter_layout_modes(
+    request: ReadFilterLayoutRequest,
+) -> dict[str, dict[str, object]]:
+    """Build compact read layouts for all checkbox combinations."""
+    return build_read_filter_layouts(request)
+
+
+def _layout_mode_delta(
+    read_name: str,
+    mode: str,
+    layout_modes: Mapping[str, Mapping[str, object]],
+) -> float | None:
+    """Return the y shift for a read in a layout mode, or None if hidden."""
+    all_layout = layout_modes.get("all", {})
+    mode_layout = layout_modes.get(mode, {})
+    all_positions = all_layout.get("read_to_y", {})
+    mode_positions = mode_layout.get("read_to_y", {})
+    if not isinstance(all_positions, Mapping) or not isinstance(mode_positions, Mapping):
+        return None
+    if read_name not in all_positions or read_name not in mode_positions:
+        return None
+    return float(mode_positions[read_name]) - float(all_positions[read_name])
+
+
+def _add_scalar_layout_mode_columns(
+    source_data: dict,
+    layout_modes: Mapping[str, Mapping[str, object]],
+    column_names: Sequence[str],
+) -> None:
+    """Add alternate scalar y columns to a read-indexed source dictionary."""
+    layout_read_names = source_data.get("layout_read_name") or source_data.get("read_name")
+    if not layout_read_names:
+        return
+    for mode in READ_FILTER_LAYOUT_MODES:
+        for column_name in column_names:
+            if column_name not in source_data:
+                continue
+            mode_values = []
+            for row_index, base_value in enumerate(source_data[column_name]):
+                delta = _layout_mode_delta(
+                    str(layout_read_names[row_index]),
+                    mode,
+                    layout_modes,
+                )
+                mode_values.append(base_value if delta is None else base_value + delta)
+            source_data[_layout_mode_column(column_name, mode)] = mode_values
+
+
+def _add_line_layout_mode_columns(
+    source_data: dict,
+    layout_modes: Mapping[str, Mapping[str, object]],
+    column_name: str,
+) -> None:
+    """Add alternate y polyline columns to a read-indexed source dictionary."""
+    layout_read_names = source_data.get("layout_read_name") or source_data.get("read_name")
+    if not layout_read_names or column_name not in source_data:
+        return
+    for mode in READ_FILTER_LAYOUT_MODES:
+        mode_values = []
+        for row_index, base_values in enumerate(source_data[column_name]):
+            delta = _layout_mode_delta(
+                str(layout_read_names[row_index]),
+                mode,
+                layout_modes,
+            )
+            if delta is None:
+                mode_values.append(list(base_values))
+            else:
+                mode_values.append([value + delta for value in base_values])
+        source_data[_layout_mode_column(column_name, mode)] = mode_values
+
+
+def _add_clickable_layout_mode_columns(
+    clickable_data: dict,
+    layout_modes: Mapping[str, Mapping[str, object]],
+) -> None:
+    """Add alternate y columns to clickable-label data before source creation."""
+    clickable_data["read_name"] = [
+        str(info.get("read_name", "")) for info in clickable_data["customdata"]
+    ]
+    clickable_data["layout_read_name"] = [
+        str(info.get("layout_read_name", info.get("read_name", "")))
+        for info in clickable_data["customdata"]
+    ]
+    _add_scalar_layout_mode_columns(clickable_data, layout_modes, ("y",))
+
+
+def _add_read_layout_mode_columns(
+    arrow_data: dict,
+    clickable_data: dict,
+    variant_data: dict,
+    connector_data: dict,
+    same_region_connector_data: dict,
+    layout_modes: Mapping[str, Mapping[str, object]],
+) -> None:
+    """Annotate read-derived Bokeh source dictionaries with compact y layouts."""
+    _add_scalar_layout_mode_columns(arrow_data, layout_modes, ("y", "y0", "y1"))
+    _add_clickable_layout_mode_columns(clickable_data, layout_modes)
+    for data in variant_data.values():
+        _add_scalar_layout_mode_columns(data, layout_modes, ("y",))
+    _add_scalar_layout_mode_columns(connector_data, layout_modes, ("y",))
+    _add_line_layout_mode_columns(same_region_connector_data, layout_modes, "ys")
+
+
+def _layout_mode_y_bounds(
+    layout_modes: Mapping[str, Mapping[str, object]],
+) -> dict[str, list[float]]:
+    """Return y-range bounds for each compact read layout mode."""
+    bounds = {}
+    for mode in READ_FILTER_LAYOUT_MODES:
+        layout = layout_modes.get(mode, {})
+        alignments_height = float(layout.get("alignments_height", 0.0))
+        top_padding = max(alignments_height * 0.02, 0.5)
+        bounds[mode] = [alignments_height, -top_padding]
+    return bounds
+
+
+def _group_end_y_by_layout_mode(
+    haplotype: int,
+    layout_modes: Mapping[str, Mapping[str, object]],
+    fallback_y: float,
+) -> dict[str, float]:
+    """Return insertion-summary marker y positions for all layout modes."""
+    y_by_mode = {}
+    for mode in READ_FILTER_LAYOUT_MODES:
+        group_boundaries = layout_modes.get(mode, {}).get("group_boundaries", {})
+        if isinstance(group_boundaries, Mapping) and haplotype in group_boundaries:
+            y_by_mode[mode] = float(group_boundaries[haplotype][1]) + 0.3
+        else:
+            y_by_mode[mode] = fallback_y
+    return y_by_mode
+
+
+def phase_block_boundaries_by_haplotype(
+    segments_by_read: Mapping[str, Sequence[object]],
+    coordinate_start: int,
+    coordinate_end: int,
+) -> dict[int, list[int]]:
+    """Return visible phase-set start/end markers grouped by haplotype."""
+    block_ends: dict[tuple[int, int], int] = {}
+    for segments in segments_by_read.values():
+        for segment in segments:
+            haplotype_tag = getattr(segment, "haplotype_tag", None)
+            phaseset_tag = getattr(segment, "phaseset_tag", None)
+            if haplotype_tag is None or phaseset_tag is None:
+                continue
+            try:
+                haplotype = int(haplotype_tag)
+                phaseset_start = int(phaseset_tag)
+            except (TypeError, ValueError):
+                continue
+            if haplotype <= 0:
+                continue
+
+            segment_start = int(getattr(segment, "pos", coordinate_end + 1))
+            segment_end = int(getattr(segment, "end", coordinate_start - 1))
+            if segment_start > coordinate_end or segment_end < coordinate_start:
+                continue
+
+            block_key = (haplotype, phaseset_start)
+            block_ends[block_key] = max(block_ends.get(block_key, segment_end), segment_end)
+
+    boundaries: dict[int, set[int]] = {}
+    for (haplotype, phaseset_start), block_end in block_ends.items():
+        for position in (phaseset_start, block_end):
+            if coordinate_start <= position <= coordinate_end:
+                boundaries.setdefault(haplotype, set()).add(position)
+
+    return {haplotype: sorted(positions) for haplotype, positions in boundaries.items()}
+
+
+def _phase_block_spans(
+    group_boundaries: Mapping[int, tuple[float, float]],
+) -> dict[int, tuple[float, float]]:
+    """Return y spans for phase-block markers by haplotype."""
+    ordered_groups = sorted(group_boundaries.items(), key=lambda item: item[1][0])
+    block_spans = {}
+    for group_index, (haplotype, (y_start, y_end)) in enumerate(ordered_groups):
+        block_y_start = y_start
+        block_y_end = y_end
+        if group_index > 0:
+            previous_y_end = ordered_groups[group_index - 1][1][1]
+            block_y_start = (previous_y_end + y_start) / 2
+        if group_index + 1 < len(ordered_groups):
+            next_y_start = ordered_groups[group_index + 1][1][0]
+            block_y_end = (y_end + next_y_start) / 2
+        block_spans[haplotype] = (block_y_start, block_y_end)
+    return block_spans
+
+
+def add_phase_block_boundaries_to_plot(
+    plot_figure,
+    phase_boundaries: Mapping[int, Sequence[int]],
+    group_boundaries: Mapping[int, tuple[float, float]],
+    coordinate_start: int,
+    coordinate_end: int,
+    layout_modes: Mapping[str, Mapping[str, object]] | None = None,
+):
+    """Render phase-block boundary rules inside each haplotype lane."""
+    xs = []
+    ys = []
+    colors = []
+    row_haplotypes = []
+    block_spans = _phase_block_spans(group_boundaries)
+
+    for haplotype, positions in phase_boundaries.items():
+        if haplotype not in block_spans:
+            continue
+        y_start, y_end = block_spans[haplotype]
+        if y_start == y_end:
+            continue
+        for position in positions:
+            if coordinate_start <= position <= coordinate_end:
+                xs.append([position, position])
+                ys.append([y_start, y_end])
+                colors.append(PLOT_CONFIG["sample_label_color"])
+                row_haplotypes.append(haplotype)
+
+    if not xs:
+        return None
+
+    source_data = {
+        "xs": xs,
+        "ys": ys,
+        "color": colors,
+        "read_layout_mode": ["all"] * len(xs),
+    }
+    for mode in READ_FILTER_LAYOUT_MODES:
+        mode_boundaries = {}
+        if layout_modes:
+            mode_boundaries = layout_modes.get(mode, {}).get("group_boundaries", {})
+        mode_spans = _phase_block_spans(mode_boundaries) if mode_boundaries else block_spans
+        source_data[_layout_mode_column("ys", mode)] = [
+            [
+                mode_spans.get(haplotype, block_spans[haplotype])[0],
+                mode_spans.get(haplotype, block_spans[haplotype])[1],
+            ]
+            for haplotype in row_haplotypes
+        ]
+
+    add_read_filter_visibility_columns(source_data)
+    source = ColumnDataSource(source_data)
+    return plot_figure.multi_line(
+        xs="xs",
+        ys="ys",
+        source=source,
+        line_color="color",
+        line_width=PLOT_CONFIG["phase_block_line_width"],
+        line_alpha=PLOT_CONFIG["phase_block_line_alpha"],
+        line_dash=PLOT_CONFIG["phase_block_line_dash"],
+        level="underlay",
     )
-
-
-def get_base_color(base):
-    """Get IGV-style color for a nucleotide base."""
-    return PLOT_CONFIG["base_colors"].get(base.upper(), PLOT_CONFIG["variant_color_unknown"])
-
-
-def get_vcf_variant_color(variant):
-    """Get color for a VCF variant based on its type."""
-    if variant.variant_type == "SNP" and variant.alt_base:
-        return get_base_color(variant.alt_base)
-    elif variant.variant_type == "INSERTION":
-        return PLOT_CONFIG["variant_color_insertion"]
-    elif variant.variant_type == "DELETION":
-        return PLOT_CONFIG["variant_color_deletion"]
-    else:
-        return PLOT_CONFIG["variant_color_unknown"]
 
 
 def add_vcf_variants(vcf_figure, vcf_variants, coordinate_start, coordinate_end, sample_label=None):
@@ -150,319 +453,104 @@ def add_vcf_variants(vcf_figure, vcf_variants, coordinate_start, coordinate_end,
         variant_source.selected.js_on_change("indices", variant_click_callback)
 
 
-def process_segments(
-    segments_by_read,
-    read_names,
-    read_to_y,
-    read_heights,
-    coordinate_start,
-    coordinate_end,
-    region_type,
-    sample_label=None,
-):
-    """Process segments and extract arrow, clickable label, and variant data."""
-    arrow_x0_list, arrow_x1_list, arrow_y_list, arrow_color_list, arrow_read_names = (
-        [],
-        [],
-        [],
-        [],
-        [],
-    )
-    clickable_x, clickable_y, clickable_customdata = [], [], []
-    mismatch_x, mismatch_y, mismatch_alt, mismatch_color = [], [], [], []
-    insertion_x, insertion_y, insertion_size, insertion_count, insertion_is_1bp = (
-        [],
-        [],
-        [],
-        [],
-        [],
-    )
-    deletion_x0, deletion_x1, deletion_y, deletion_is_1bp = [], [], [], []
-
-    for read_name in read_names:
-        segments = segments_by_read[read_name]
-        y_pos = read_to_y[read_name]
-        read_height = read_heights[read_name]
-        num_segments = len(segments)
-        for idx, segment in enumerate(segments):
-            start, end = segment.pos, segment.end
-            if start < coordinate_end and end > coordinate_start:
-                plot_start = max(start, coordinate_start)
-                plot_end = min(end, coordinate_end)
-                color = get_segment_color(segment, region_type=region_type)
-                if num_segments > 1:
-                    spacing = read_height / (num_segments + 1)
-                    y_offset = -read_height / 2 + spacing * (idx + 1)
-                else:
-                    y_offset = 0
-                y_plot = y_pos + y_offset
-                if segment.is_fwd_strand:
-                    arrow_x0, arrow_x1 = plot_start, plot_end
-                else:
-                    arrow_x0, arrow_x1 = plot_end, plot_start
-                mid_x = (plot_start + plot_end) / 2
-                if abs(arrow_x1 - arrow_x0) > 0:
-                    arrow_x0_list.append(arrow_x0)
-                    arrow_x1_list.append(arrow_x1)
-                    arrow_y_list.append(y_plot)
-                    arrow_color_list.append(color)
-                    arrow_read_names.append(segment.readname)
-
-                if hasattr(segment, "mismatches") and segment.mismatches:
-                    for ref_pos, alt_base in segment.mismatches:
-                        ref_pos_1based = ref_pos + 1
-                        if coordinate_start <= ref_pos_1based <= coordinate_end:
-                            mismatch_x.append(ref_pos_1based)
-                            mismatch_y.append(y_plot)
-                            mismatch_alt.append(alt_base)
-                            mismatch_color.append(get_base_color(alt_base))
-                if hasattr(segment, "insertions") and segment.insertions:
-                    for ref_pos, inserted_bases in segment.insertions:
-                        ref_pos_1based = ref_pos + 1
-                        if coordinate_start <= ref_pos_1based <= coordinate_end:
-                            insertion_x.append(ref_pos_1based)
-                            insertion_y.append(y_plot)
-                            insertion_size.append(
-                                min(
-                                    PLOT_CONFIG["insertion_size_max"],
-                                    max(
-                                        PLOT_CONFIG["insertion_size_min"],
-                                        len(inserted_bases),
-                                    ),
-                                )
-                            )
-                            insertion_count.append(len(inserted_bases))
-                            insertion_is_1bp.append(len(inserted_bases) == 1)
-                if hasattr(segment, "deletions") and segment.deletions:
-                    for del_start, del_end in segment.deletions:
-                        del_start_1based = del_start + 1
-                        del_end_1based = del_end - 1
-                        if (
-                            del_start_1based <= coordinate_end
-                            and del_end_1based >= coordinate_start
-                        ):
-                            visible_start = max(del_start_1based, coordinate_start)
-                            visible_end = min(del_end_1based, coordinate_end)
-                            deletion_x0.append(visible_start)
-                            deletion_x1.append(visible_end)
-                            deletion_y.append(y_plot)
-                            deletion_is_1bp.append((del_end - del_start) == 1)
-
-                strand_str = "Forward (+)" if segment.is_fwd_strand else "Reverse (-)"
-                haplotype_str = (
-                    f"HP:{segment.haplotype_tag}" if segment.haplotype_tag else "Unassigned"
-                )
-                clickable_x.append(mid_x)
-                clickable_y.append(y_plot)
-                alignment_number = getattr(segment, "alignment_order", 0) or (idx + 1)
-                clickable_customdata.append(
-                    {
-                        "read_name": segment.readname,
-                        "alignment_number": alignment_number,
-                        "strand": strand_str,
-                        "coordinates": f"{segment.chrom}:{segment.pos}-{segment.end}",
-                        "haplotype": haplotype_str,
-                        "sample_label": sample_label or "",
-                    }
-                )
-
-    return (
-        {
-            "x0": arrow_x0_list,
-            "x1": arrow_x1_list,
-            "y": arrow_y_list,
-            "color": arrow_color_list,
-            "read_name": arrow_read_names,
-        },
-        {"x": clickable_x, "y": clickable_y, "customdata": clickable_customdata},
-        {
-            "mismatch": {
-                "x": mismatch_x,
-                "y": mismatch_y,
-                "alt": mismatch_alt,
-                "color": mismatch_color,
-            },
-            "insertion": {
-                "x": insertion_x,
-                "y": insertion_y,
-                "size": insertion_size,
-                "count": insertion_count,
-                "is_1bp": insertion_is_1bp,
-            },
-            "deletion": {
-                "x0": deletion_x0,
-                "x1": deletion_x1,
-                "y": deletion_y,
-                "is_1bp": deletion_is_1bp,
-            },
-        },
-    )
-
-
-def add_arrows_to_plot(plot_figure, arrow_data):
+def add_arrows_to_plot(plot_figure, arrow_data, allow_empty=False):
     """Add arrow segments and arrowheads to the plot using batched glyphs."""
-    if not arrow_data["x0"]:
+    return plot_renderers.add_arrows_to_plot(plot_figure, arrow_data, allow_empty)
+
+
+def add_read_connection_markers_to_plot(plot_figure, connector_data):
+    """Render in-panel read-continuation endpoint markers."""
+    if not connector_data["stub_x0"]:
         return None
-    arrow_source = ColumnDataSource(data=arrow_data)
-    arrow_renderer = plot_figure.segment(
-        x0="x0",
-        y0="y",
-        x1="x1",
-        y1="y",
-        source=arrow_source,
-        line_color="color",
-        line_width=PLOT_CONFIG["arrow_line_width"],
-        line_alpha=PLOT_CONFIG["arrow_line_alpha"],
-        selection_line_color=PLOT_CONFIG["arrow_selection_line_color"],
-        selection_line_alpha=1,
-        selection_line_width=PLOT_CONFIG["arrow_selection_line_width"],
-        nonselection_line_alpha=PLOT_CONFIG["arrow_nonselection_line_alpha"],
-        nonselection_line_width=PLOT_CONFIG["arrow_nonselection_line_width"],
+    cfg = PLOT_CONFIG
+    row_count = len(connector_data["stub_x0"])
+    connector_data = dict(connector_data)
+    connector_data.setdefault("read_filter_alpha", [1.0] * row_count)
+    connector_data.setdefault("has_split_alignment", [False] * row_count)
+    connector_data.setdefault("has_multiregion_connection", [False] * row_count)
+    connector_data.setdefault("connector_line_alpha", [0.9] * row_count)
+    connector_data.setdefault("connector_selected_alpha", [1.0] * row_count)
+    connector_data.setdefault(
+        "connector_nonselected_alpha",
+        [cfg["connector_nonselection_alpha"]] * row_count,
     )
-    arrowhead_angles = []
-    for i in range(len(arrow_data["x0"])):
-        x0, x1 = arrow_data["x0"][i], arrow_data["x1"][i]
-        arrowhead_angles.append(-math.pi / 2 if x1 > x0 else math.pi / 2)
-    arrowhead_source = ColumnDataSource(
-        data={
-            "x": arrow_data["x1"],
-            "y": arrow_data["y"],
-            "color": arrow_data["color"],
-            "angle": arrowhead_angles,
-        }
-    )
-    plot_figure.scatter(
-        x="x",
+    add_read_filter_visibility_columns(connector_data)
+    connector_source = ColumnDataSource(data=connector_data)
+    marker_renderer = plot_figure.scatter(
+        x="marker_x",
         y="y",
-        source=arrowhead_source,
-        marker="triangle",
-        size=PLOT_CONFIG["arrowhead_size"],
-        angle="angle",
-        fill_color="color",
-        fill_alpha=PLOT_CONFIG["arrowhead_fill_alpha"],
-        line_color="color",
-        line_alpha=PLOT_CONFIG["arrowhead_line_alpha"],
-        line_width=PLOT_CONFIG["arrowhead_line_width"],
+        source=connector_source,
+        marker="circle",
+        size=cfg["connector_marker_size"],
+        fill_color=cfg["connector_marker_fill_color"],
+        fill_alpha=0.0,
+        line_color=cfg["connector_marker_line_color"],
+        line_alpha="connector_line_alpha",
+        line_width=2.0,
+        selection_fill_color=cfg["connector_selection_color"],
+        selection_fill_alpha=0.0,
+        selection_line_color=cfg["connector_selection_color"],
+        selection_line_alpha="connector_selected_alpha",
+        nonselection_fill_alpha=cfg["connector_nonselection_alpha"],
+        nonselection_line_alpha="connector_nonselected_alpha",
+        name="orographer_read_connector_marker",
     )
-    return arrow_source, arrow_renderer
+    return connector_source, None, marker_renderer
+
+
+def add_same_region_read_connection_lines_to_plot(plot_figure, connector_data):
+    """Render same-region read-continuation lines as discrete selectable paths."""
+    if not connector_data["xs"]:
+        return None
+    cfg = PLOT_CONFIG
+    row_count = len(connector_data["xs"])
+    connector_data = dict(connector_data)
+    connector_data.setdefault("read_filter_alpha", [1.0] * row_count)
+    connector_data.setdefault("has_split_alignment", [False] * row_count)
+    connector_data.setdefault("has_multiregion_connection", [False] * row_count)
+    connector_data.setdefault("connector_line_alpha", [cfg["connector_line_alpha"]] * row_count)
+    connector_data.setdefault(
+        "connector_selected_alpha",
+        [cfg["connector_selection_line_alpha"]] * row_count,
+    )
+    connector_data.setdefault(
+        "connector_nonselected_alpha",
+        [cfg["connector_nonselection_alpha"]] * row_count,
+    )
+    add_read_filter_visibility_columns(connector_data)
+    connector_source = ColumnDataSource(data=connector_data)
+    renderer = plot_figure.multi_line(
+        xs="xs",
+        ys="ys",
+        source=connector_source,
+        line_color=cfg["connector_line_color"],
+        line_width=cfg["connector_line_width"],
+        line_alpha="connector_line_alpha",
+        line_dash="dashed",
+        selection_line_color=cfg["connector_selection_line_color"],
+        selection_line_alpha="connector_selected_alpha",
+        selection_line_width=cfg["connector_selection_line_width"],
+        nonselection_line_alpha="connector_nonselected_alpha",
+    )
+    plot_figure.multi_line(
+        xs="xs",
+        ys="ys",
+        source=connector_source,
+        line_color=cfg["connector_selection_line_color"],
+        line_width=cfg["connector_hit_line_width"],
+        line_alpha=0.001,
+        selection_line_alpha=0.001,
+        selection_line_width=cfg["connector_hit_line_width"],
+        nonselection_line_alpha=0.001,
+        nonselection_line_width=cfg["connector_hit_line_width"],
+        name="orographer_same_region_connector_hit_area",
+    )
+    return connector_source, renderer
 
 
 def add_variants_to_plot(plot_figure, variant_data):
     """Add variant markers (mismatches, insertions, deletions); return LOD/1bp."""
-    renderers = {
-        "marker": [],
-        "text": [],
-        "one_bp": [],
-        "one_bp_markers": [],
-        "one_bp_texts": [],
-        "one_bp_segments": [],
-    }
-    mismatch_data = variant_data["mismatch"]
-    if mismatch_data["x"]:
-        mismatch_source = ColumnDataSource(data=mismatch_data)
-        mismatch_marker = plot_figure.scatter(
-            x="x",
-            y="y",
-            source=mismatch_source,
-            marker="square",
-            size=PLOT_CONFIG["mismatch_size"],
-            fill_color="color",
-            fill_alpha=PLOT_CONFIG["mismatch_fill_alpha"],
-            line_color="color",
-            line_alpha=PLOT_CONFIG["mismatch_line_alpha"],
-            line_width=PLOT_CONFIG["mismatch_line_width"],
-        )
-        renderers["marker"].append(mismatch_marker)
-        mismatch_text = plot_figure.text(
-            x="x",
-            y="y",
-            text="alt",
-            source=mismatch_source,
-            text_font_size=PLOT_CONFIG["mismatch_text_font_size"],
-            text_color="color",
-            text_align="center",
-            text_baseline="middle",
-            text_font_style="bold",
-        )
-        mismatch_text.visible = False
-        renderers["text"].append(mismatch_text)
-    insertion_data = variant_data["insertion"]
-    if insertion_data["x"]:
-        insertion_is_1bp = insertion_data["is_1bp"]
-        idx_1bp = [i for i, b in enumerate(insertion_is_1bp) if b]
-        idx_other = [i for i, b in enumerate(insertion_is_1bp) if not b]
-        insertion_color = PLOT_CONFIG["variant_color_insertion"]
-        for idx_list, is_one_bp in [(idx_1bp, True), (idx_other, False)]:
-            if not idx_list:
-                continue
-            sub = {k: [v[i] for i in idx_list] for k, v in insertion_data.items() if k != "is_1bp"}
-            sub_source = ColumnDataSource(data=sub)
-            marker = plot_figure.scatter(
-                x="x",
-                y="y",
-                source=sub_source,
-                marker="square",
-                size="size",
-                fill_color=insertion_color,
-                fill_alpha=PLOT_CONFIG["insertion_fill_alpha"],
-                line_color=insertion_color,
-                line_alpha=PLOT_CONFIG["insertion_line_alpha"],
-                line_width=PLOT_CONFIG["insertion_line_width"],
-            )
-            renderers["marker"].append(marker)
-            if is_one_bp:
-                renderers["one_bp"].append(marker)
-                renderers["one_bp_markers"].append(marker)
-            text_data = {
-                "x": sub["x"],
-                "y": sub["y"],
-                "text": [f"{sub['count'][j]}I" for j in range(len(sub["x"]))],
-            }
-            text_source = ColumnDataSource(data=text_data)
-            text = plot_figure.text(
-                x="x",
-                y="y",
-                text="text",
-                source=text_source,
-                text_font_size=PLOT_CONFIG["insertion_text_font_size"],
-                text_color=insertion_color,
-                text_align="center",
-                text_baseline="middle",
-                text_font_style="bold",
-            )
-            text.visible = False
-            renderers["text"].append(text)
-            if is_one_bp:
-                renderers["one_bp"].append(text)
-                renderers["one_bp_texts"].append(text)
-    deletion_data = variant_data["deletion"]
-    if deletion_data["x0"]:
-        deletion_is_1bp = deletion_data["is_1bp"]
-        idx_1bp = [i for i, b in enumerate(deletion_is_1bp) if b]
-        idx_other = [i for i, b in enumerate(deletion_is_1bp) if not b]
-        for idx_list, is_one_bp in [(idx_1bp, True), (idx_other, False)]:
-            if not idx_list:
-                continue
-            sub = {
-                "x0": [deletion_data["x0"][i] for i in idx_list],
-                "x1": [deletion_data["x1"][i] for i in idx_list],
-                "y": [deletion_data["y"][i] for i in idx_list],
-            }
-            sub_source = ColumnDataSource(data=sub)
-            seg = plot_figure.segment(
-                x0="x0",
-                y0="y",
-                x1="x1",
-                y1="y",
-                source=sub_source,
-                line_color=PLOT_CONFIG["variant_color_deletion"],
-                line_width=PLOT_CONFIG["deletion_line_width"],
-                line_alpha=PLOT_CONFIG["deletion_line_alpha"],
-            )
-            if is_one_bp:
-                renderers["one_bp"].append(seg)
-                renderers["one_bp_segments"].append(seg)
-    return renderers
+    return plot_renderers.add_variants_to_plot(plot_figure, variant_data)
 
 
 def setup_variant_lod_callback(
@@ -490,6 +578,16 @@ def setup_variant_lod_callback(
     plot_figure.x_range.js_on_change("end", callback)
 
 
+def clickable_label_source_data(clickable_data):
+    """Return ColumnDataSource data for clickable alignment labels."""
+    return source_data.clickable_label_source_data(clickable_data)
+
+
+def empty_clickable_label_source_data():
+    """Return empty label source columns matching clickable_label_source_data()."""
+    return source_data.empty_clickable_label_source_data()
+
+
 def add_clickable_labels(
     plot_figure,
     tap_tool,
@@ -498,74 +596,30 @@ def add_clickable_labels(
     arrow_renderer=None,
     arrow_tap_callback=None,
     reset_callback=None,
+    allow_empty=False,
 ):
     """Add clickable number labels with modal; optional arrow tap/reset callbacks.
     Returns list of renderers for visibility toggling, or None if no labels.
     """
-    if not clickable_data["x"]:
-        return None
-    source = ColumnDataSource(
-        data={
-            "x": clickable_data["x"],
-            "y": clickable_data["y"],
-            "text": [str(info["alignment_number"]) for info in clickable_data["customdata"]],
-            "read_name": [info["read_name"] for info in clickable_data["customdata"]],
-            "alignment_number": [info["alignment_number"] for info in clickable_data["customdata"]],
-            "strand": [info["strand"] for info in clickable_data["customdata"]],
-            "coordinates": [info["coordinates"] for info in clickable_data["customdata"]],
-            "haplotype": [info["haplotype"] for info in clickable_data["customdata"]],
-            "sample_label": [info.get("sample_label", "") for info in clickable_data["customdata"]],
-        }
+    return plot_renderers.add_clickable_labels(
+        plot_figure,
+        tap_tool,
+        clickable_data,
+        arrow_source=arrow_source,
+        arrow_renderer=arrow_renderer,
+        arrow_tap_callback=arrow_tap_callback,
+        reset_callback=reset_callback,
+        allow_empty=allow_empty,
     )
-    cfg = PLOT_CONFIG
-    visible_circles = plot_figure.scatter(
-        "x",
-        "y",
-        source=source,
-        size=cfg["alignment_label_visible_size"],
-        marker="circle",
-        fill_color=cfg["alignment_label_fill_color"],
-        line_color=cfg["alignment_label_fill_color"],
-        alpha=0.8,
-    )
-    circles = plot_figure.scatter(
-        "x",
-        "y",
-        source=source,
-        size=cfg["alignment_label_hit_size"],
-        marker="circle",
-        fill_color=cfg["alignment_label_fill_color"],
-        line_color=cfg["alignment_label_fill_color"],
-        alpha=0,
-    )
-    tap_tool.renderers = [circles]
-    if arrow_source is not None and arrow_renderer is not None:
-        if arrow_tap_callback is None:
-            arrow_tap_callback = get_arrow_tap_callback(arrow_source)
-            plot_figure.js_on_event("tap", arrow_tap_callback)
-        if reset_callback is None:
-            reset_callback = CustomJS(
-                args={"source": arrow_source},
-                code=load_javascript("arrow_reset_callback.js"),
-            )
-        plot_figure.js_on_event("reset", reset_callback)
-    label_text = plot_figure.text(
-        "x",
-        "y",
-        text="text",
-        source=source,
-        text_font_size=cfg["alignment_label_text_font_size"],
-        text_color=cfg["alignment_label_text_color"],
-        text_align="center",
-        text_baseline="middle",
-        text_font_style="bold",
-    )
-    number_click_callback = get_number_click_callback(source)
-    source.selected.js_on_change("indices", number_click_callback)
-    plot_figure.add_tools(
-        HoverTool(renderers=[circles], tooltips=[("Alignment #", "@text")], visible=False)
-    )
-    return [visible_circles, circles, label_text]
+
+
+def add_alignment_number_modal_callbacks(alignment_label_sources) -> None:
+    """Attach alignment-number modal callbacks with access to every label source."""
+    for source in alignment_label_sources:
+        source.selected.js_on_change(
+            "indices",
+            get_number_click_callback(source, alignment_label_sources),
+        )
 
 
 def add_vcf_track_to_region(
@@ -619,20 +673,22 @@ def add_multi_region_callbacks(
     all_plot_figures,
     all_arrow_sources,
     all_arrow_renderers,
+    all_selectable_sources=None,
     all_region_reset_bounds=None,
 ):
     """Add cross-region highlighting callbacks and per-region range reset."""
     if len(all_arrow_sources) == 0:
         return
+    selection_sources = all_selectable_sources or all_arrow_sources
     for plot_fig, arrow_source, _arrow_renderer in zip(
         all_plot_figures, all_arrow_sources, all_arrow_renderers, strict=False
     ):
-        if len(all_arrow_sources) == 1:
+        if len(selection_sources) == 1:
             single_region_callback = get_arrow_tap_callback(arrow_source)
             plot_fig.js_on_event("tap", single_region_callback)
         else:
             multi_region_callback = get_arrow_tap_callback_multi_region(
-                arrow_source, all_arrow_sources
+                arrow_source, selection_sources
             )
             plot_fig.js_on_event("tap", multi_region_callback)
     if all_region_reset_bounds:
@@ -657,29 +713,526 @@ def add_multi_region_callbacks(
                 plot_fig.js_on_event("reset", range_reset_callback)
     else:
         shared_reset_callback = CustomJS(
-            args={"all_sources": all_arrow_sources},
+            args={"all_sources": selection_sources},
             code=load_javascript("shared_reset_callback.js"),
         )
         for plot_fig in all_plot_figures:
             plot_fig.js_on_event("reset", shared_reset_callback)
 
 
+def add_read_connection_overlay_callbacks(
+    all_plot_figures,
+    all_connector_sources,
+    all_selectable_sources=None,
+) -> None:
+    """Redraw explicit connection overlays when selected endpoints or ranges move."""
+    if not all_connector_sources:
+        return
+
+    overlay_callback = CustomJS(
+        args={"all_sources": all_selectable_sources or []},
+        code=load_javascript("read_connection_overlay_callback.js"),
+    )
+    seen_ranges = set()
+    for plot_fig in all_plot_figures:
+        for axis_range in (plot_fig.x_range, plot_fig.y_range):
+            if axis_range is None:
+                continue
+            range_id = id(axis_range)
+            if range_id in seen_ranges:
+                continue
+            seen_ranges.add(range_id)
+            axis_range.js_on_change("start", overlay_callback)
+            axis_range.js_on_change("end", overlay_callback)
+
+
+def add_alignment_label_selection_callbacks(selection_sources, alignment_label_sources) -> None:
+    """Fade alignment number labels for unselected reads while any read is selected."""
+    if not selection_sources or not alignment_label_sources:
+        return
+
+    label_callback = CustomJS(
+        args={
+            "selection_sources": selection_sources,
+            "alignment_label_sources": alignment_label_sources,
+        },
+        code=load_javascript("alignment_label_selection_callback.js"),
+    )
+    for source in selection_sources:
+        source.selected.js_on_change("indices", label_callback)
+
+
+def create_read_search_button(all_selectable_sources):
+    """Create a compact button that opens read-name selection controls in the modal."""
+    button_width = 90
+    button_height = 22
+    button_spacing = 4
+    button_render_padding = 14
+    compact_button_styles = {
+        "font-size": "11px",
+        "line-height": "1",
+        "min-width": "0",
+        "padding": "0",
+        "text-align": "center",
+        "width": f"{button_width}px",
+    }
+    read_button = Button(
+        label="Select reads",
+        button_type="default",
+        width=button_width,
+        height=button_height,
+        margin=(0, 0, 0, 0),
+        styles=compact_button_styles.copy(),
+    )
+    read_button.js_on_click(
+        CustomJS(
+            args={"all_sources": all_selectable_sources},
+            code=load_javascript("read_search_modal_callback.js"),
+        )
+    )
+    clear_button = Button(
+        label="Clear selected",
+        button_type="default",
+        width=button_width,
+        height=button_height,
+        disabled=True,
+        margin=(0, 0, 0, 0),
+        styles=compact_button_styles.copy(),
+    )
+    clear_button.js_on_click(
+        CustomJS(
+            args={"all_sources": all_selectable_sources, "clear_button": clear_button},
+            code=load_javascript("clear_read_selection_callback.js"),
+        )
+    )
+    clear_state_callback = CustomJS(
+        args={"all_sources": all_selectable_sources, "clear_button": clear_button},
+        code=load_javascript("clear_read_selection_state_callback.js"),
+    )
+    for source in all_selectable_sources:
+        source.selected.js_on_change("indices", clear_state_callback)
+    return row(
+        read_button,
+        clear_button,
+        width=(button_width + button_render_padding) * 2 + button_spacing,
+        height=button_height,
+        spacing=button_spacing,
+        sizing_mode="fixed",
+    )
+
+
+def _stable_gene_color(gene_id: str) -> str:
+    """Return a stable color for transcript glyphs from the gene of origin."""
+    return isoseq_data.stable_gene_color(gene_id)
+
+
+def _format_span(start: int, end: int) -> str:
+    return isoseq_data.format_span(start, end)
+
+
+def _intron_direction_positions(
+    intron_start: int,
+    intron_end: int,
+    region_span: int,
+) -> list[float]:
+    """Return capped, evenly spaced x positions for transcript strand markers."""
+    return isoseq_data.intron_direction_positions(intron_start, intron_end, region_span)
+
+
+def _safe_chunk_token(value) -> str:
+    """Return a filesystem-safe token for lazy-loaded chunk files."""
+    return isoseq_data.safe_chunk_token(value)
+
+
+def _natural_sort_key(value):
+    """Return a case-insensitive sort key that treats digit runs numerically."""
+    return isoseq_data.natural_sort_key(value)
+
+
+def _empty_arrow_source_data():
+    """Return empty read-glyph columns compatible with add_arrows_to_plot()."""
+    return source_data.empty_arrow_source_data()
+
+
+def _empty_isoseq_coverage_data():
+    return source_data.empty_isoseq_coverage_data()
+
+
+def _coverage_blocks_for_read(read_name, segments_by_read, coordinate_start, coordinate_end):
+    yield from coverage_data.coverage_blocks_for_read(
+        read_name,
+        segments_by_read,
+        coordinate_start,
+        coordinate_end,
+    )
+
+
+def _isoseq_coverage_block_cache(segments_by_read, coordinate_start, coordinate_end):
+    """Cache per-read coverage blocks once for transcript coverage assembly."""
+    return coverage_data.coverage_block_cache(segments_by_read, coordinate_start, coordinate_end)
+
+
+def _isoseq_coverage_for_cached_reads(
+    read_names,
+    coverage_blocks,
+    coordinate_start,
+    coordinate_end,
+):
+    return coverage_data.coverage_for_cached_reads(
+        read_names,
+        coverage_blocks,
+        coordinate_start,
+        coordinate_end,
+    )
+
+
+def _isoseq_coverage_for_blocks(blocks, coordinate_start, coordinate_end):
+    return coverage_data.coverage_for_blocks(blocks, coordinate_start, coordinate_end)
+
+
+def _isoseq_read_page_url_template(chunk_url_prefix, chunk_key):
+    """Return a browser-loadable static manifest URL for IsoSeq read pages."""
+    return isoseq_store.read_manifest_url(chunk_url_prefix, chunk_key)
+
+
+def _isoseq_coverage_url(chunk_url_prefix, chunk_key):
+    """Return a browser-loadable static JSON URL for one transcript coverage payload."""
+    return isoseq_store.coverage_url(chunk_url_prefix, chunk_key)
+
+
+def _write_isoseq_read_page(
+    chunk_dir,
+    chunk_key,
+    page,
+    payload,
+):
+    """Write one static IsoSeq read page payload."""
+    if not chunk_dir:
+        return
+    os.makedirs(chunk_dir, exist_ok=True)
+    page_path = os.path.join(chunk_dir, f"{chunk_key}_page{page}.json.gz")
+    compact_payload = _compact_isoseq_read_page_payload(payload)
+    write_json_gzip(page_path, compact_payload)
+
+
+def _write_isoseq_coverage_page(
+    chunk_dir,
+    chunk_key,
+    coverage_data,
+):
+    """Write one static IsoSeq transcript coverage payload."""
+    isoseq_store.write_coverage_page(chunk_dir, chunk_key, coverage_data)
+
+
+def _compact_isoseq_read_page_payload(payload):
+    """Return a lean payload that browser code expands into Bokeh source columns."""
+    arrow_data = payload["arrow_data"]
+    label_data = payload["label_data"]
+    first_coordinate = next(iter(label_data.get("coordinates", [])), "")
+    chrom = first_coordinate.split(":", 1)[0] if ":" in first_coordinate else ""
+    read_index_by_name = {}
+    reads = {
+        "name": [],
+        "gene_id": [],
+        "gene_name": [],
+        "transcript_id": [],
+        "group_id": [],
+        "strand": [],
+        "haplotype": [],
+        "sample_label": [],
+        "all_alignment_numbers": [],
+        "all_alignment_coordinates": [],
+    }
+    block_read_indices = []
+    for row_index, read_name in enumerate(arrow_data["read_name"]):
+        if read_name not in read_index_by_name:
+            read_index_by_name[read_name] = len(reads["name"])
+            reads["name"].append(read_name)
+            reads["gene_id"].append(arrow_data["gene_id"][row_index])
+            reads["gene_name"].append(arrow_data["gene_name"][row_index])
+            reads["transcript_id"].append(arrow_data["transcript_id"][row_index])
+            reads["group_id"].append(arrow_data["group_id"][row_index])
+            reads["strand"].append(label_data["strand"][row_index])
+            reads["haplotype"].append(label_data["haplotype"][row_index])
+            reads["sample_label"].append(label_data["sample_label"][row_index])
+            reads["all_alignment_numbers"].append(label_data["all_alignment_numbers"][row_index])
+            reads["all_alignment_coordinates"].append(
+                label_data["all_alignment_coordinates"][row_index]
+            )
+        block_read_indices.append(read_index_by_name[read_name])
+
+    blocks = {
+        "read_index": block_read_indices,
+        "x0": arrow_data["x0"],
+        "x1": arrow_data["x1"],
+        "y": arrow_data["y"],
+        "y0": arrow_data["y0"],
+        "y1": arrow_data["y1"],
+        "color": arrow_data["color"],
+        "segment_id": arrow_data["segment_id"],
+        "alignment_order": arrow_data["alignment_order"],
+        "fwd_read_start": arrow_data["fwd_read_start"],
+        "fwd_read_end": arrow_data["fwd_read_end"],
+    }
+    return {
+        "schema": "isoseq_compact_v1",
+        "chrom": chrom,
+        "reads": reads,
+        "blocks": blocks,
+        "page": payload["page"],
+        "page_size": payload["page_size"],
+        "loaded_read_count": payload["loaded_read_count"],
+        "assigned_read_count": payload["assigned_read_count"],
+    }
+
+
+def _isoseq_block_number_by_index(segment_blocks, is_fwd_strand):
+    return isoseq_data.block_number_by_index(segment_blocks, is_fwd_strand)
+
+
+def _isoseq_read_shard_record(read_name, segments, read_metadata):
+    return isoseq_data.read_shard_record(read_name, segments, read_metadata)
+
+
+def _write_isoseq_read_store(
+    chunk_dir,
+    chunk_url_prefix,
+    manifest_key,
+    groups,
+    read_records,
+    read_id_by_name,
+    manifest_context,
+):
+    isoseq_store.write_read_store(
+        chunk_dir,
+        manifest_key,
+        groups,
+        read_records,
+        read_id_by_name,
+        manifest_context,
+    )
+
+
+def _alignment_summaries_for_segments(row_index, segments_by_read):
+    summaries = {}
+    for display_read_name, segments in segments_by_read.items():
+        for segment in segments:
+            read_name = getattr(segment, "readname", display_read_name)
+            summaries.setdefault((row_index, read_name), []).append(
+                {
+                    "alignment_number": getattr(segment, "alignment_order", 0),
+                    "coordinates": format_alignment_coordinates(
+                        segment.chrom,
+                        segment.pos,
+                        segment.end,
+                    ),
+                    "region_idx": 0,
+                    "fwd_read_start": getattr(segment, "fwd_read_start", 0),
+                    "fwd_read_end": getattr(segment, "fwd_read_end", 0),
+                    "pos": segment.pos,
+                    "end": segment.end,
+                }
+            )
+    for entries in summaries.values():
+        entries.sort(
+            key=lambda entry: (
+                entry["alignment_number"],
+                entry["fwd_read_start"],
+                entry["fwd_read_end"],
+                entry["region_idx"],
+                entry["pos"],
+                entry["end"],
+            )
+        )
+    return summaries
+
+
+def _normalise_isoseq_arrow_source_data(arrow_data):
+    """Return read glyph data with every browser source column populated."""
+    return isoseq_data.normalise_arrow_source_data(arrow_data)
+
+
+def _render_isoseq_read_page_payload(
+    group,
+    page_read_names,
+    segments_by_read,
+    read_metadata,
+    coordinate_start,
+    coordinate_end,
+    region_idx,
+    row_index,
+    sample_label,
+    plot_dom_class,
+    plot_model_id,
+    selected_read_y_start,
+    page,
+):
+    """Render one portable IsoSeq read page without any runtime BAM dependency."""
+    read_height = 0.24
+    read_to_y = {
+        read_name: selected_read_y_start + index * read_height + read_height / 2
+        for index, read_name in enumerate(page_read_names)
+    }
+    read_heights = dict.fromkeys(page_read_names, read_height)
+    page_segments_by_read = {
+        read_name: segments_by_read[read_name]
+        for read_name in page_read_names
+        if read_name in segments_by_read
+    }
+    alignment_summaries = _alignment_summaries_for_segments(row_index, page_segments_by_read)
+    arrow_data, clickable_data, _variants, _connectors, _same_region = process_segments(
+        page_segments_by_read,
+        page_read_names,
+        read_to_y,
+        read_heights,
+        coordinate_start,
+        coordinate_end,
+        ISOSEQ_REGION_TYPE,
+        sample_label=sample_label or "",
+        region_idx=region_idx,
+        row_index=row_index,
+        connection_index={},
+        alignment_summaries=alignment_summaries,
+        plot_dom_class=plot_dom_class,
+        plot_model_id=plot_model_id,
+    )
+    page_read_metadata = {
+        read_name: read_metadata.get(read_name, {}) for read_name in page_read_names
+    }
+    _add_isoseq_metadata_to_sources(arrow_data, clickable_data, page_read_metadata)
+    return {
+        "arrow_data": _normalise_isoseq_arrow_source_data(arrow_data),
+        "label_data": clickable_label_source_data(clickable_data),
+        "page": page,
+        "page_size": ISOSEQ_READ_PAGE_SIZE,
+        "loaded_read_count": len(page_read_names),
+        "assigned_read_count": int(group.get("assigned_read_count", len(page_read_names))),
+    }
+
+
+def _prepare_isoseq_lazy_chunks(
+    groups,
+    segments_by_read,
+    layout,
+    coordinate_start,
+    coordinate_end,
+    region_idx,
+    row_index,
+    sample_label,
+    plot_dom_class,
+    plot_model_id,
+    chunk_dir=None,
+    chunk_url_prefix=None,
+):
+    """Write static sharded read data for browser-side IsoSeq lazy loading."""
+    return isoseq_store.prepare_lazy_chunks(
+        groups,
+        segments_by_read,
+        layout,
+        coordinate_start,
+        coordinate_end,
+        region_idx,
+        row_index,
+        sample_label,
+        chunk_dir=chunk_dir,
+        chunk_url_prefix=chunk_url_prefix,
+    )
+
+
+def _build_isoseq_layout(groups, segments_by_read):
+    """Return row positions for IsoSeq transcript/read groups."""
+    return isoseq_data.build_layout(groups, segments_by_read)
+
+
+def _add_isoseq_metadata_to_sources(arrow_data, clickable_data, read_metadata):
+    """Attach transcript/gene metadata to read glyph and label sources."""
+    isoseq_data.add_metadata_to_sources(arrow_data, clickable_data, read_metadata)
+
+
+def _get_expected_haplotypes(bam_row):
+    """Return haplotypes that should get reserved slots for this BAM row."""
+    coverage_tracks = bam_row.get("coverage_tracks")
+    region_type = bam_row.get("region_type")
+    if coverage_tracks and region_type == COMPLEX_SV_REGION_TYPE:
+        return {hp for hp in coverage_tracks if hp != -1}
+    return None
+
+
 def _build_bam_row_track(
-    bam_row, coordinate_start, coordinate_end, region_state, region_idx, row_index
+    bam_row,
+    region,
+    coordinate_start,
+    coordinate_end,
+    region_state,
+    region_idx,
+    row_index,
+    connection_index=None,
+    alignment_summaries=None,
+    isoseq_chunk_dir=None,
+    isoseq_chunk_url_prefix=None,
 ):
     """Add one BAM row to the region. Mutates region_state. Skips if no segments."""
+    if bam_row.get("region_type") == ISOSEQ_REGION_TYPE:
+        _build_isoseq_bam_row_track(
+            bam_row,
+            region,
+            coordinate_start,
+            coordinate_end,
+            region_state,
+            region_idx,
+            row_index,
+            alignment_summaries=alignment_summaries,
+            add_vcf_track_to_region_fn=add_vcf_track_to_region,
+            isoseq_chunk_dir=isoseq_chunk_dir,
+            isoseq_chunk_url_prefix=isoseq_chunk_url_prefix,
+        )
+        return
+
     segments_by_read = bam_row["segments_by_read"]
     if not segments_by_read:
         logger.debug(f"No segments to plot for region {region_idx + 1}, row {row_index + 1}.")
         return
 
     vcf_variants = bam_row.get("vcf_variants")
+    coverage_tracks = bam_row.get("coverage_tracks")
     region_type = bam_row["region_type"]
     sample_label = bam_row.get("sample_label")
 
-    read_names, haplotype_groups, haplotype_order = sort_read_names(segments_by_read)
+    expected_haplotypes = _get_expected_haplotypes(bam_row)
+    read_names, haplotype_groups, haplotype_order = sort_read_names(
+        segments_by_read, expected_haplotypes
+    )
+    draw_read_names = read_names
+    min_read_heights = connector_offset_min_heights_by_read(
+        segments_by_read,
+        region,
+        region_idx,
+        row_index,
+        connection_index,
+    )
     read_to_y, read_to_y_bottom, read_heights, alignments_height, group_boundaries = (
-        calculate_read_positions(read_names, segments_by_read, haplotype_groups)
+        calculate_read_positions(
+            read_names,
+            segments_by_read,
+            haplotype_groups,
+            haplotype_order,
+            min_read_heights_by_read=min_read_heights,
+        )
+    )
+    read_filter_flags_by_read = _read_filter_flags_by_layout_read(
+        segments_by_read,
+        row_index,
+        alignment_summaries,
+    )
+    layout_modes = _build_read_filter_layout_modes(
+        ReadFilterLayoutRequest(
+            read_names=read_names,
+            segments_by_read=segments_by_read,
+            haplotype_groups=haplotype_groups,
+            haplotype_order=haplotype_order,
+            read_filter_flags_by_read=read_filter_flags_by_read,
+            min_read_heights_by_read=min_read_heights,
+        )
     )
 
     if region_state.shared_x_range is None:
@@ -693,6 +1246,17 @@ def _build_bam_row_track(
         plot_figure, tap_tool = create_bokeh_figure_shared_x(
             region_state.shared_x_range, alignments_height
         )
+    plot_dom_class = f"orographer-alignment-plot-r{region_idx}-row{row_index}"
+    plot_figure.css_classes = [*plot_figure.css_classes, plot_dom_class]
+    color_haplotypes = list(haplotype_order)
+    if coverage_tracks:
+        for hp in coverage_tracks:
+            if hp != -1 and hp not in color_haplotypes:
+                color_haplotypes.append(hp)
+    haplotype_color_map = build_haplotype_color_map(color_haplotypes)
+
+    def haplotype_color_fn(hp):
+        return haplotype_color_map.get(hp, get_haplotype_color(hp))
 
     if sample_label:
         region_state.row_components.append(
@@ -712,6 +1276,12 @@ def _build_bam_row_track(
             )
         )
 
+    if coverage_tracks:
+        cov_figure = create_coverage_figure(plot_figure)
+        add_coverage_to_figure(cov_figure, coverage_tracks, haplotype_color_map)
+        region_state.row_components.append(cov_figure)
+        region_state.cursor_guide_figures.append(cov_figure)
+
     vcf_figure = add_vcf_track_to_region(
         plot_figure,
         vcf_variants,
@@ -721,39 +1291,99 @@ def _build_bam_row_track(
     )
     if vcf_figure:
         region_state.row_components.append(vcf_figure)
+        region_state.cursor_guide_figures.append(vcf_figure)
         region_state.vcf_figures.append(vcf_figure)
     else:
         region_state.vcf_figures.append(None)
 
-    add_separator_lines(
+    separator_source = add_separator_lines(
         plot_figure,
         read_names,
         read_to_y_bottom,
         read_heights,
         coordinate_start,
         coordinate_end,
+        layout_modes=layout_modes,
+        read_filter_flags_by_read=read_filter_flags_by_read,
     )
-    arrow_data, clickable_data, variant_data = process_segments(
+    region_state.read_filter_sources.append(separator_source)
+    phase_boundaries = phase_block_boundaries_by_haplotype(
         segments_by_read,
-        read_names,
+        coordinate_start,
+        coordinate_end,
+    )
+    phase_set_marker_renderer = add_phase_block_boundaries_to_plot(
+        plot_figure,
+        phase_boundaries,
+        group_boundaries,
+        coordinate_start,
+        coordinate_end,
+        layout_modes=layout_modes,
+    )
+    if phase_set_marker_renderer is not None:
+        region_state.phase_set_marker_renderers.append(phase_set_marker_renderer)
+        region_state.read_filter_sources.append(phase_set_marker_renderer.data_source)
+    (
+        arrow_data,
+        clickable_data,
+        variant_data,
+        connector_data,
+        same_region_connector_data,
+    ) = process_segments(
+        segments_by_read,
+        draw_read_names,
         read_to_y,
         read_heights,
         coordinate_start,
         coordinate_end,
         region_type,
         sample_label=sample_label,
+        region_idx=region_idx,
+        row_index=row_index,
+        connection_index=connection_index,
+        alignment_summaries=alignment_summaries,
+        plot_dom_class=plot_dom_class,
+        plot_model_id=plot_figure.id,
+    )
+    _add_read_layout_mode_columns(
+        arrow_data,
+        clickable_data,
+        variant_data,
+        connector_data,
+        same_region_connector_data,
+        layout_modes,
     )
     arrow_result = add_arrows_to_plot(plot_figure, arrow_data)
     arrow_source = arrow_result[0] if arrow_result else None
     arrow_renderer = arrow_result[1] if arrow_result else None
+    connector_result = add_read_connection_markers_to_plot(plot_figure, connector_data)
+    connector_source = connector_result[0] if connector_result else None
+    same_region_connector_result = add_same_region_read_connection_lines_to_plot(
+        plot_figure,
+        same_region_connector_data,
+    )
+    same_region_connector_source = (
+        same_region_connector_result[0] if same_region_connector_result else None
+    )
     if arrow_source:
         region_state.arrow_sources.append(arrow_source)
+        region_state.read_filter_sources.append(arrow_source)
     if arrow_renderer:
         region_state.arrow_renderers.append(arrow_renderer)
+    if connector_source:
+        region_state.connector_sources.append(connector_source)
+        region_state.read_filter_sources.append(connector_source)
+    if same_region_connector_source:
+        region_state.connector_sources.append(same_region_connector_source)
+        region_state.read_filter_sources.append(same_region_connector_source)
     top_padding = max(alignments_height * 0.02, 0.5)
     region_state.y_bounds.append((plot_figure.y_range, alignments_height, -top_padding))
+    region_state.read_filter_y_bounds.append(
+        (plot_figure.y_range, _layout_mode_y_bounds(layout_modes))
+    )
     # Vertical scroll when zoomed is handled by WheelPanTool(dimensions="height") on the figure
     variant_renderers = add_variants_to_plot(plot_figure, variant_data)
+    region_state.read_filter_sources.extend(variant_renderers.get("sources", []))
     row_one_bp = variant_renderers.get("one_bp", [])
     region_state.one_bp_renderers.extend(row_one_bp)
     region_state.one_bp_markers.extend(variant_renderers.get("one_bp_markers", []))
@@ -761,7 +1391,7 @@ def _build_bam_row_track(
     region_state.one_bp_segments.extend(variant_renderers.get("one_bp_segments", []))
     region_state.variant_renderers.append(variant_renderers)
     region_state.one_bp_by_row.append(row_one_bp)
-    label_renderers = add_clickable_labels(
+    label_result = add_clickable_labels(
         plot_figure,
         tap_tool,
         clickable_data,
@@ -769,16 +1399,54 @@ def _build_bam_row_track(
         arrow_renderer,
         arrow_tap_callback=CustomJS(code=""),
     )
-    if label_renderers:
+    if label_result:
+        label_source, label_renderers = label_result
+        region_state.alignment_label_sources.append(label_source)
         region_state.alignment_label_renderers.extend(label_renderers)
-    add_haplotype_labels(
-        plot_figure, group_boundaries, haplotype_order, coordinate_start, coordinate_end
+        region_state.read_filter_sources.append(label_source)
+    region_state.read_filter_sources.extend(
+        add_haplotype_labels(
+            plot_figure,
+            group_boundaries,
+            haplotype_order,
+            coordinate_start,
+            coordinate_end,
+            haplotype_color_fn=haplotype_color_fn,
+            layout_modes=layout_modes,
+        )
     )
     region_state.row_components.append(plot_figure)
     region_state.plot_figures.append(plot_figure)
+    region_state.cursor_guide_figures.append(plot_figure)
+
+    insertion_summary = bam_row.get("insertion_summary", {})
+    for hp in sorted(insertion_summary.keys()):
+        sites = insertion_summary[hp]
+        if not sites or hp not in group_boundaries:
+            continue
+        y_pos = group_boundaries[hp][1] + 0.3
+        ins_renderer, insertion_sources = add_insertion_markers_to_figure(
+            plot_figure,
+            sites,
+            hp,
+            y_pos,
+            coordinate_start,
+            coordinate_end,
+            y_by_layout_mode=_group_end_y_by_layout_mode(hp, layout_modes, y_pos),
+            color=haplotype_color_fn(hp),
+        )
+        region_state.read_filter_sources.extend(insertion_sources)
+        current_renderers = tap_tool.renderers
+        if isinstance(current_renderers, list):
+            tap_tool.renderers = [*current_renderers, ins_renderer]
 
 
-def _build_region_layout_column(region_data, region_state):
+def _build_region_layout_column(
+    region_data,
+    region_state,
+    region_idx,
+    hide_1bp_checkbox_override=None,
+):
     """Build column layout for one region and reset bounds. Returns (column, bounds)."""
     region = region_data["region"]
     coordinate_start = region.start
@@ -791,13 +1459,11 @@ def _build_region_layout_column(region_data, region_state):
         chromosome,
         coordinate_start,
         coordinate_end,
-        one_bp_renderers=region_state.one_bp_renderers,
-        one_bp_markers=region_state.one_bp_markers,
-        one_bp_texts=region_state.one_bp_texts,
-        one_bp_segments=region_state.one_bp_segments,
-        alignment_label_renderers=region_state.alignment_label_renderers,
-        default_hide_alignment_numbers=(region_state.region_type == PARAPHASE_REGION_TYPE),
+        read_search_button=None,
+        show_checkbox_controls=False,
+        model_name_suffix="" if region_idx == 0 else f"region_{region_idx}",
     )
+    active_hide_1bp_checkbox = hide_1bp_checkbox or hide_1bp_checkbox_override
     for plot_fig, var_rend, one_bp in zip(
         region_state.plot_figures,
         region_state.variant_renderers,
@@ -808,21 +1474,26 @@ def _build_region_layout_column(region_data, region_state):
             plot_fig,
             var_rend,
             one_bp_renderers=one_bp,
-            hide_1bp_checkbox=hide_1bp_checkbox,
+            hide_1bp_checkbox=active_hide_1bp_checkbox,
         )
     layout_components = [coord_div, *region_state.row_components]
 
-    gene_figure, _ = add_gene_track_to_region(
-        region_state.first_plot_figure,
-        gene_annotations,
-        coordinate_start,
-        coordinate_end,
-    )
+    gene_figure = None
+    if region_state.region_type != ISOSEQ_REGION_TYPE:
+        gene_figure, _ = add_gene_track_to_region(
+            region_state.first_plot_figure,
+            gene_annotations,
+            coordinate_start,
+            coordinate_end,
+        )
     if gene_figure:
         layout_components.append(gene_figure)
+        region_state.cursor_guide_figures.append(gene_figure)
 
     _hide_xaxis_on_track_figures(region_state, gene_figure)
-    layout_components.append(create_genomic_x_axis_strip(region_state.shared_x_range))
+    axis_strip = create_genomic_x_axis_strip(region_state.shared_x_range)
+    region_state.cursor_guide_figures.append(axis_strip)
+    layout_components.append(axis_strip)
 
     region_layout = column(*layout_components, sizing_mode="stretch_both", spacing=0)
     region_reset_bounds = {
@@ -831,9 +1502,52 @@ def _build_region_layout_column(region_data, region_state):
         "x_end": coordinate_end,
         "y_ranges": [b[0] for b in region_state.y_bounds],
         "y_bounds": [[b[1], b[2]] for b in region_state.y_bounds],
-        "all_sources": region_state.arrow_sources,
+        "all_sources": [*region_state.arrow_sources, *region_state.connector_sources],
     }
-    return region_layout, region_reset_bounds
+    return region_layout, region_reset_bounds, hide_1bp_checkbox
+
+
+def _global_control_renderers(region_builds):
+    """Collect renderers controlled by the single multi-region checkbox block."""
+    one_bp_renderers = []
+    one_bp_markers = []
+    one_bp_texts = []
+    one_bp_segments = []
+    alignment_label_renderers = []
+    phase_set_marker_renderers = []
+    read_filter_sources = []
+    read_filter_y_ranges = []
+    read_filter_y_bounds = []
+    region_types = set()
+
+    for _region_idx, _region_data, region_state in region_builds:
+        one_bp_renderers.extend(region_state.one_bp_renderers)
+        one_bp_markers.extend(region_state.one_bp_markers)
+        one_bp_texts.extend(region_state.one_bp_texts)
+        one_bp_segments.extend(region_state.one_bp_segments)
+        alignment_label_renderers.extend(region_state.alignment_label_renderers)
+        phase_set_marker_renderers.extend(region_state.phase_set_marker_renderers)
+        read_filter_sources.extend(region_state.read_filter_sources)
+        read_filter_y_ranges.extend(bounds[0] for bounds in region_state.read_filter_y_bounds)
+        read_filter_y_bounds.extend(bounds[1] for bounds in region_state.read_filter_y_bounds)
+        region_types.add(region_state.region_type)
+
+    return {
+        "one_bp_renderers": one_bp_renderers,
+        "one_bp_markers": one_bp_markers,
+        "one_bp_texts": one_bp_texts,
+        "one_bp_segments": one_bp_segments,
+        "alignment_label_renderers": alignment_label_renderers,
+        "phase_set_marker_renderers": phase_set_marker_renderers,
+        "read_filter_sources": read_filter_sources,
+        "read_filter_y_ranges": read_filter_y_ranges,
+        "read_filter_y_bounds": read_filter_y_bounds,
+        "default_hide_alignment_numbers": PARAPHASE_REGION_TYPE in region_types,
+        "default_hide_1bp_indels": bool(
+            {COMPLEX_SV_REGION_TYPE, ISOSEQ_REGION_TYPE} & region_types
+        ),
+        "enable_read_filter_checkboxes": COMPLEX_SV_REGION_TYPE in region_types,
+    }
 
 
 def plot_reads_bokeh(region_data_list, output_config):
@@ -846,13 +1560,55 @@ def plot_reads_bokeh(region_data_list, output_config):
         logger.debug("No regions to plot.")
         return None
     output_file = generate_multi_region_filename(
-        region_data_list, output_config.output_dir, output_config.prefix
+        region_data_list,
+        output_config.output_dir,
+        output_config.prefix,
+        filename_regions=output_config.filename_regions,
     )
+    has_isoseq = any(
+        bam_row.get("region_type") == ISOSEQ_REGION_TYPE
+        for region_data in region_data_list
+        for bam_row in region_data.get("bam_rows", [])
+    )
+    all_isoseq = has_isoseq and all(
+        bam_row.get("region_type") == ISOSEQ_REGION_TYPE
+        for region_data in region_data_list
+        for bam_row in region_data.get("bam_rows", [])
+    )
+    isoseq_chunk_dir = None
+    isoseq_chunk_url_prefix = None
+    if has_isoseq:
+        output_stem = os.path.splitext(os.path.basename(output_file))[0]
+        isoseq_chunk_url_prefix = f"{output_stem}_chunks"
+        isoseq_chunk_dir = os.path.join(os.path.dirname(output_file), isoseq_chunk_url_prefix)
+        if os.path.isdir(isoseq_chunk_dir):
+            for chunk_filename in os.listdir(isoseq_chunk_dir):
+                is_json = chunk_filename.endswith(".json") or chunk_filename.endswith(".json.gz")
+                if is_json or chunk_filename.endswith(".msgpack.gz"):
+                    os.remove(os.path.join(isoseq_chunk_dir, chunk_filename))
     all_arrow_sources = []
     all_arrow_renderers = []
+    all_selectable_sources = []
+    all_connector_sources = []
+    all_transcript_sources = []
+    all_isoseq_filter_sources = []
+    all_isoseq_transcript_label_sources = []
+    all_isoseq_intron_sources = []
+    all_isoseq_intron_arrow_sources = []
+    all_isoseq_feature_label_sources = []
+    all_alignment_label_sources = []
     all_region_layouts = []
     all_plot_figures = []
+    all_cursor_guide_figures = []
+    all_cursor_guide_spans = []
     all_region_reset_bounds = []
+    region_builds = []
+    connection_index = {}
+    alignment_summaries = {}
+    if not all_isoseq:
+        assign_region_agnostic_alignment_orders(region_data_list)
+        connection_index = build_read_connection_index(region_data_list)
+        alignment_summaries = build_read_alignment_summaries(region_data_list)
 
     for region_idx, region_data in enumerate(region_data_list):
         region = region_data["region"]
@@ -865,19 +1621,122 @@ def plot_reads_bokeh(region_data_list, output_config):
         for row_index, bam_row in enumerate(bam_rows):
             _build_bam_row_track(
                 bam_row,
+                region,
                 coordinate_start,
                 coordinate_end,
                 region_state,
                 region_idx,
                 row_index,
+                connection_index=connection_index,
+                alignment_summaries=alignment_summaries,
+                isoseq_chunk_dir=isoseq_chunk_dir,
+                isoseq_chunk_url_prefix=isoseq_chunk_url_prefix,
             )
 
         if not region_state.first_plot_figure:
             logger.debug(f"No segments to plot for region {region_idx + 1}.")
             continue
 
-        region_layout, region_reset_bounds = _build_region_layout_column(region_data, region_state)
+        all_arrow_sources.extend(region_state.arrow_sources)
+        all_arrow_renderers.extend(region_state.arrow_renderers)
+        all_selectable_sources.extend(region_state.arrow_sources)
+        all_selectable_sources.extend(region_state.connector_sources)
+        all_connector_sources.extend(region_state.connector_sources)
+        all_transcript_sources.extend(region_state.transcript_sources)
+        all_isoseq_filter_sources.extend(region_state.isoseq_filter_sources)
+        all_isoseq_transcript_label_sources.extend(region_state.isoseq_transcript_label_sources)
+        all_isoseq_intron_sources.extend(region_state.isoseq_intron_sources)
+        all_isoseq_intron_arrow_sources.extend(region_state.isoseq_intron_arrow_sources)
+        all_isoseq_feature_label_sources.extend(region_state.isoseq_feature_label_sources)
+        all_alignment_label_sources.extend(region_state.alignment_label_sources)
+        all_plot_figures.extend(region_state.plot_figures)
+        region_builds.append((region_idx, region_data, region_state))
+
+    global_control_renderers = _global_control_renderers(region_builds)
+    global_checkbox_controls = None
+    global_hide_1bp_checkbox = None
+    global_cursor_guide_checkbox = None
+    if region_builds:
+        _first_region_idx, first_region_data, first_region_state = region_builds[0]
+        shared_dotplot_payload = region_data_list[0].get("dotplot_payload")
+        dotplot_thumbnail = None
+        if shared_dotplot_payload is not None:
+            dotplot_thumbnail = create_dotplot_thumbnail(
+                first_region_state.first_plot_figure,
+                shared_dotplot_payload["matrix"],
+                first_region_data["region"],
+                size=18,
+                blocks=shared_dotplot_payload["blocks"],
+                region_label=shared_dotplot_payload["label"],
+                modal_title=shared_dotplot_payload["title"],
+            )
+        read_search_controls = (
+            create_read_search_button(all_selectable_sources) if all_selectable_sources else None
+        )
+        isoseq_controls = create_isoseq_controls(
+            all_transcript_sources,
+            [
+                *all_arrow_sources,
+                *all_alignment_label_sources,
+                *all_isoseq_filter_sources,
+            ],
+            transcript_label_sources=all_isoseq_transcript_label_sources,
+            intron_sources=all_isoseq_intron_sources,
+            intron_arrow_sources=all_isoseq_intron_arrow_sources,
+            feature_label_sources=all_isoseq_feature_label_sources,
+            read_arrow_sources=all_arrow_sources,
+            read_label_sources=all_alignment_label_sources,
+            plot_figures=all_plot_figures,
+            dotplot_thumbnail=dotplot_thumbnail,
+        )
+        if read_search_controls is not None and isoseq_controls is not None:
+            read_search_width = getattr(read_search_controls, "width", 0) or 0
+            isoseq_width = getattr(isoseq_controls, "width", 0) or 0
+            read_search_controls = row(
+                read_search_controls,
+                isoseq_controls,
+                spacing=14,
+                sizing_mode="fixed",
+                width=read_search_width + isoseq_width + 14,
+                height=30,
+            )
+        elif isoseq_controls is not None:
+            read_search_controls = isoseq_controls
+        (
+            global_checkbox_controls,
+            global_hide_1bp_checkbox,
+            global_cursor_guide_checkbox,
+        ) = create_global_checkbox_controls(
+            first_region_state.first_plot_figure,
+            dotplot_thumbnail=None if isoseq_controls is not None else dotplot_thumbnail,
+            read_search_controls=read_search_controls,
+            one_bp_renderers=global_control_renderers["one_bp_renderers"],
+            one_bp_markers=global_control_renderers["one_bp_markers"],
+            one_bp_texts=global_control_renderers["one_bp_texts"],
+            one_bp_segments=global_control_renderers["one_bp_segments"],
+            alignment_label_renderers=global_control_renderers["alignment_label_renderers"],
+            phase_set_marker_renderers=global_control_renderers["phase_set_marker_renderers"],
+            default_hide_alignment_numbers=global_control_renderers[
+                "default_hide_alignment_numbers"
+            ],
+            default_hide_1bp_indels=global_control_renderers["default_hide_1bp_indels"],
+            enable_read_filter_checkboxes=global_control_renderers["enable_read_filter_checkboxes"],
+            read_filter_sources=global_control_renderers["read_filter_sources"],
+            read_filter_y_ranges=global_control_renderers["read_filter_y_ranges"],
+            read_filter_y_bounds=global_control_renderers["read_filter_y_bounds"],
+        )
+    for _layout_idx, (region_idx, region_data, region_state) in enumerate(region_builds):
+        region_layout, region_reset_bounds, _hide_1bp_checkbox = _build_region_layout_column(
+            region_data,
+            region_state,
+            region_idx,
+            hide_1bp_checkbox_override=global_hide_1bp_checkbox,
+        )
         all_region_layouts.append(region_layout)
+        all_cursor_guide_figures.extend(region_state.cursor_guide_figures)
+        all_cursor_guide_spans.extend(
+            add_cursor_guide_to_figures(region_state.cursor_guide_figures)
+        )
         all_region_reset_bounds.append(
             (
                 region_state.plot_figures,
@@ -886,9 +1745,6 @@ def plot_reads_bokeh(region_data_list, output_config):
                 region_reset_bounds,
             )
         )
-        all_arrow_sources.extend(region_state.arrow_sources)
-        all_arrow_renderers.extend(region_state.arrow_renderers)
-        all_plot_figures.extend(region_state.plot_figures)
 
     if not all_region_layouts:
         no_data_div = Div(
@@ -897,12 +1753,34 @@ def plot_reads_bokeh(region_data_list, output_config):
         )
         all_region_layouts = [column(no_data_div, sizing_mode="stretch_both")]
 
-    final_layout = row(*all_region_layouts, sizing_mode="stretch_both", spacing=20)
+    region_row = row(*all_region_layouts, sizing_mode="stretch_both", spacing=20)
+    if global_checkbox_controls is not None:
+        final_layout = column(
+            global_checkbox_controls,
+            region_row,
+            sizing_mode="stretch_both",
+            spacing=0,
+        )
+    else:
+        final_layout = region_row
     add_multi_region_callbacks(
         all_plot_figures,
         all_arrow_sources,
         all_arrow_renderers,
+        all_selectable_sources,
         all_region_reset_bounds,
+    )
+    add_read_connection_overlay_callbacks(
+        all_plot_figures,
+        all_connector_sources,
+        all_selectable_sources,
+    )
+    add_alignment_number_modal_callbacks(all_alignment_label_sources)
+    add_alignment_label_selection_callbacks(all_selectable_sources, all_alignment_label_sources)
+    add_cursor_guide_callbacks(
+        all_cursor_guide_figures,
+        all_cursor_guide_spans,
+        global_cursor_guide_checkbox,
     )
     save_plot_with_modal(final_layout, output_file, output_config.prefix)
     return output_file

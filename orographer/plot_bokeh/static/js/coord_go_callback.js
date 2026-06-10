@@ -56,6 +56,7 @@ if (match) {
                 if (bothInBounds) {
                     x_range.start = start;
                     x_range.end = end;
+                    x_range.change.emit();
                     isValid = true;
                     error_div.text = "";
                     error_div.styles = {

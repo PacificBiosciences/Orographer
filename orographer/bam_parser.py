@@ -5,6 +5,7 @@ Implements data structures and parsing functions for split alignments.
 
 import re
 from collections import defaultdict
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +13,8 @@ import pysam
 from intervaltree import Interval, IntervalTree
 
 from .utils import Region
+
+CoverageHaplotype = int | str
 
 
 @dataclass
@@ -57,7 +60,9 @@ class FwdStrandReadSegment:
     mismatches: list[tuple[int, str]] = None  # List of (ref_position, alt_base) tuples
     insertions: list[tuple[int, str]] = None  # List of (ref_position, inserted_bases) tuples
     deletions: list[tuple[int, int]] = None  # List of (ref_start, ref_end) tuples
+    aligned_blocks: list[tuple[int, int]] = None  # Reference blocks, 0-based half-open
     alignment_order: int = 0  # 1-based order within the read (set in order_alignments)
+    inclusion_reason: str | None = None
 
     def __post_init__(self):
         if self.mismatches is None:
@@ -66,6 +71,23 @@ class FwdStrandReadSegment:
             self.insertions = []
         if self.deletions is None:
             self.deletions = []
+        if self.aligned_blocks is None:
+            self.aligned_blocks = [(self.pos, self.end)]
+
+
+@dataclass(slots=True)
+class AlignmentSummary:
+    """Cheap discovery-time record for one BAM alignment. No FASTA, no variant extraction."""
+
+    read_name: str
+    chromosome: str
+    start: int  # reference_start (0-based)
+    end: int  # reference_end
+    is_supplementary: bool
+    has_sa: bool
+    sa_tag: str | None  # raw SA string; doubles as SA parse-cache key
+    max_indel: int = 0  # longest I or D op in cigartuples; 0 if unset or unmapped
+    max_softclip: int = 0  # longest S op in cigartuples; 0 if unset or unmapped
 
 
 @dataclass
@@ -172,6 +194,7 @@ def extract_variants(
 
     # Get aligned pairs (query_pos, ref_pos); no with_seq to avoid MD tag
     aligned_pairs = record.get_aligned_pairs(matches_only=False)
+    insertion_query_positions = insertion_query_positions_from_cigar(record.cigartuples)
 
     # Track current insertion/deletion runs
     current_insertion_start_ref = None
@@ -181,7 +204,7 @@ def extract_variants(
 
     for query_pos, ref_pos in aligned_pairs:
         # Handle insertions (query has base, reference doesn't)
-        if ref_pos is None and query_pos is not None:
+        if ref_pos is None and query_pos is not None and query_pos in insertion_query_positions:
             if current_insertion_start_ref is None:
                 current_insertion_start_ref = (
                     last_ref_pos if last_ref_pos is not None else ref_start
@@ -232,6 +255,18 @@ def extract_variants(
         deletions.append((current_deletion_start, last_ref_pos + 1))
 
     return mismatches, insertions, deletions
+
+
+def insertion_query_positions_from_cigar(cigartuples: list[tuple[int, int]] | None) -> set[int]:
+    """Return query positions that belong to true CIGAR insertion operations."""
+    insertion_positions: set[int] = set()
+    query_pos = 0
+    for op, length in cigartuples or []:
+        if op == 1:
+            insertion_positions.update(range(query_pos, query_pos + length))
+        if op in (0, 1, 4, 7, 8):
+            query_pos += length
+    return insertion_positions
 
 
 def get_cigarseg_ref_offset(cigar_op: tuple) -> int:
@@ -445,6 +480,7 @@ def process_primary_alignment(
         mismatches=mismatches,
         insertions=insertions,
         deletions=deletions,
+        aligned_blocks=record.get_blocks(),
     )
 
     context.fwd_read_split_segments.append(alignment)
@@ -618,10 +654,18 @@ def convert_alignment_to_segment(
         mismatches=mismatches,
         insertions=insertions,
         deletions=deletions,
+        aligned_blocks=record.get_blocks(),
     )
 
 
-def fetch_all_alignments(bam_path, region: Region, only_split=False, reference_path=None):
+def fetch_all_alignments(
+    bam_path,
+    region: Region,
+    only_split=False,
+    reference_path=None,
+    read_name_filter=None,
+    record_callback=None,
+):
     """
     Fetch alignments from BAM file for the specified region.
 
@@ -631,6 +675,9 @@ def fetch_all_alignments(bam_path, region: Region, only_split=False, reference_p
         only_split (bool): If True, only fetch reads with SA tags (split alignments).
                           If False, fetch all reads (split and non-split).
         reference_path (str): Path to reference FASTA file for mismatch extraction.
+        read_name_filter (set[str] | None): Optional raw read names to include.
+        record_callback: Optional callable invoked once per fetched, non-secondary,
+                         de-duplicated record before segment conversion.
 
     Returns:
         dict: Read name -> list of FwdStrandReadSegment
@@ -665,12 +712,16 @@ def fetch_all_alignments(bam_path, region: Region, only_split=False, reference_p
                 continue
 
             read_name = alignment.query_name
+            if read_name_filter is not None and read_name not in read_name_filter:
+                continue
             ref_start = alignment.reference_start
 
             alignment_key = (read_name, ref_start)
             if alignment_key in processed_alignments:
                 continue
             processed_alignments.add(alignment_key)
+            if record_callback is not None:
+                record_callback(alignment)
 
             # Supplementary alignments can have their own HP/PS; update existing segment
             # (from primary's SA parse) or add one if we saw this supp first.
@@ -684,6 +735,7 @@ def fetch_all_alignments(bam_path, region: Region, only_split=False, reference_p
                     for s in existing:
                         s.haplotype_tag = supp_hp
                         s.phaseset_tag = supp_ps
+                        s.aligned_blocks = alignment.get_blocks() or [(s.pos, s.end)]
                     if ref_fasta:
                         mismatches, insertions, deletions = extract_variants(alignment, ref_fasta)
                         for s in existing:
@@ -742,6 +794,93 @@ def fetch_all_alignments(bam_path, region: Region, only_split=False, reference_p
         raise RuntimeError(f"Error reading BAM file: {err}") from err
 
 
+def build_alignments_from_records(
+    records,
+    region: Region,
+    reference_path=None,
+    read_name_filter=None,
+):
+    """Build display segments from already-fetched BAM records.
+
+    This mirrors fetch_all_alignments() without performing a second indexed BAM
+    fetch, which is useful when a caller needs full variant-bearing segments for
+    a sampled subset after a lightweight first pass.
+    """
+    ref_fasta = pysam.FastaFile(reference_path) if reference_path else None
+    try:
+        exclude_regions = ExcludeRegions(regions={})
+        segments_by_read = defaultdict(list)
+        processed_alignments = set()
+        for alignment in records:
+            if alignment.is_secondary:
+                continue
+            read_name = alignment.query_name
+            if read_name_filter is not None and read_name not in read_name_filter:
+                continue
+            ref_start = alignment.reference_start
+            alignment_key = (read_name, ref_start)
+            if alignment_key in processed_alignments:
+                continue
+            processed_alignments.add(alignment_key)
+
+            if alignment.is_supplementary:
+                supp_hp = get_optional_int_aux_tag(alignment, "HP")
+                supp_ps = get_optional_int_aux_tag(alignment, "PS")
+                existing = [
+                    s for s in segments_by_read[read_name] if s.pos == alignment.reference_start
+                ]
+                if existing:
+                    for s in existing:
+                        s.haplotype_tag = supp_hp
+                        s.phaseset_tag = supp_ps
+                        s.aligned_blocks = alignment.get_blocks() or [(s.pos, s.end)]
+                    if ref_fasta:
+                        mismatches, insertions, deletions = extract_variants(alignment, ref_fasta)
+                        for s in existing:
+                            s.mismatches = list(mismatches)
+                            s.insertions = list(insertions)
+                            s.deletions = list(deletions)
+                else:
+                    segment = convert_alignment_to_segment(
+                        alignment, alignment.reference_name, ref_fasta
+                    )
+                    if segment:
+                        segment.from_primary_bam_record = False
+                        segments_by_read[read_name].append(segment)
+                continue
+
+            if alignment.has_tag("SA"):
+                split_segments = get_fwd_read_split_segments(
+                    alignment, region.chromosome, exclude_regions, ref_fasta
+                )
+                if split_segments:
+                    existing_positions = {s.pos for s in segments_by_read[read_name]}
+                    for seg in split_segments:
+                        if seg.from_primary_bam_record:
+                            segments_by_read[read_name].append(seg)
+                        elif seg.pos not in existing_positions:
+                            segments_by_read[read_name].append(seg)
+                            existing_positions.add(seg.pos)
+            else:
+                segment = convert_alignment_to_segment(alignment, region.chromosome, ref_fasta)
+                if segment:
+                    segments_by_read[read_name].append(segment)
+
+        order_alignments(segments_by_read)
+        segments_by_haplotype = {}
+        for rname, segs in segments_by_read.items():
+            for seg in segs:
+                hp = seg.haplotype_tag if seg.haplotype_tag is not None else 0
+                key = rname if hp == 0 else f"{rname}_HP{hp}"
+                segments_by_haplotype.setdefault(key, []).append(seg)
+        for key in segments_by_haplotype:
+            segments_by_haplotype[key].sort(key=lambda segment: segment.alignment_order)
+        return dict(segments_by_haplotype)
+    finally:
+        if ref_fasta:
+            ref_fasta.close()
+
+
 def validate_bam_file(bam_path):
     """
     Validate that the BAM file exists and is readable.
@@ -763,23 +902,6 @@ def validate_bam_file(bam_path):
         raise FileNotFoundError(f"Path is not a file: {bam_path}")
 
     return True
-
-
-def collect_all_alignments_for_reads(segments_by_read):
-    """
-    Return the segments we already have from fetch_all_alignments.
-    Since get_fwd_read_split_segments returns all segments for a read (primary + SA),
-    we don't need to do a second pass.
-
-    Args:
-        segments_by_read (dict): Read name -> list of FwdStrandReadSegment
-
-    Returns:
-        dict: Read name -> list of FwdStrandReadSegment
-    """
-    # get_fwd_read_split_segments already returns all segments for a read,
-    # we can just return what we already have
-    return segments_by_read.copy()
 
 
 def order_split_alignments(alignments):
@@ -870,6 +992,167 @@ def order_split_alignments(alignments):
     return sorted(alignments, key=sort_key)
 
 
+def fetch_alignment_summaries(
+    bam_file: pysam.AlignmentFile,
+    region: Region,
+    mapq_threshold: int = MIN_MAPQ,
+) -> list[AlignmentSummary]:
+    """
+    Cheap discovery-time fetch: returns AlignmentSummary objects without opening
+    the reference FASTA, extracting variants, or building FwdStrandReadSegment objects.
+
+    Args:
+        bam_file: Open pysam.AlignmentFile (caller owns the handle).
+        region: Genomic region to fetch (start is 1-based inclusive, converted internally).
+        mapq_threshold: Minimum mapping quality; alignments below this are skipped.
+
+    Returns:
+        List of AlignmentSummary, one per qualifying alignment (secondaries excluded).
+    """
+    summaries: list[AlignmentSummary] = []
+    start_0based = region.start - 1
+    for record in bam_file.fetch(region.chromosome, start_0based, region.end):
+        if record.is_secondary:
+            continue
+        if record.mapping_quality < mapq_threshold:
+            continue
+        if record.reference_name is None or record.reference_start is None:
+            continue
+        has_sa = record.has_tag("SA")
+        sa_tag: str | None = record.get_tag("SA") if has_sa else None
+        cigar = record.cigartuples or []
+        max_indel = max((length for op, length in cigar if op in (1, 2)), default=0)
+        max_softclip = max((length for op, length in cigar if op == 4), default=0)
+        summaries.append(
+            AlignmentSummary(
+                read_name=record.query_name,
+                chromosome=record.reference_name,
+                start=record.reference_start,
+                end=record.reference_end or (record.reference_start + 1),
+                is_supplementary=record.is_supplementary,
+                has_sa=has_sa,
+                sa_tag=sa_tag,
+                max_indel=max_indel,
+                max_softclip=max_softclip,
+            )
+        )
+    return summaries
+
+
+def _merged_coverage_blocks(record, min_gap: int):
+    """Yield (start, end) coverage blocks from record.get_blocks(), merging
+    adjacent blocks whose intervening gap is smaller than *min_gap* bp.
+
+    Small indels (< min_gap) are treated as covered; large gaps are preserved
+    as dips in the depth track.
+    """
+    blocks = record.get_blocks()
+    if not blocks:
+        return
+    cur_start, cur_end = blocks[0]
+    for block_start, block_end in blocks[1:]:
+        if block_start - cur_end < min_gap:
+            cur_end = block_end
+        else:
+            yield cur_start, cur_end
+            cur_start, cur_end = block_start, block_end
+    yield cur_start, cur_end
+
+
+def compute_coverage(
+    bam_path: str,
+    region: Region,
+    haplotypes_to_track: set[CoverageHaplotype] | None = None,
+    include_observed_haplotypes: bool = False,
+    bin_size: int = 10,
+    mapq_threshold: int = MIN_MAPQ,
+    min_cigar_gap: int = 20,
+) -> dict[CoverageHaplotype, tuple[list[int], list[int]]]:
+    """
+    Compute binned coverage for a region using a difference-array approach.
+
+    Adjacent CIGAR-aligned blocks are merged when the gap between them is smaller
+    than *min_cigar_gap* bp, smoothing over small indels while preserving large
+    structural gaps as dips in the depth track.
+    Key -1 is the total-all-reads series. Other keys are HP tag values.
+    Records without HP are included in total but not emitted as a separate series
+    unless 0 is explicitly included in haplotypes_to_track.
+
+    Args:
+        bam_path: Path to BAM file.
+        region: Genomic region (start is 1-based inclusive).
+        haplotypes_to_track: HP tag values to emit separate series for.
+            Pass None to emit total only.
+        include_observed_haplotypes: Emit separate series for each observed HP tag.
+        bin_size: Resolution in base pairs.
+        mapq_threshold: Minimum mapping quality.
+
+    Returns:
+        dict mapping haplotype value (-1=total, HP value otherwise) to x/y depth series.
+    """
+    region_len = region.end - region.start + 1
+    n_bins = (region_len + bin_size - 1) // bin_size
+
+    # Difference arrays: index = bin index; +1 at coverage start, -1 at end
+    total_diff: list[int] = [0] * (n_bins + 1)
+    hap_diffs: dict[CoverageHaplotype, list[int]] = {}
+    if haplotypes_to_track:
+        for hp in haplotypes_to_track:
+            hap_diffs[hp] = [0] * (n_bins + 1)
+
+    region_start_0 = region.start - 1  # convert to 0-based for pysam
+    try:
+        bam = pysam.AlignmentFile(bam_path, "rb")
+        for record in bam.fetch(region.chromosome, region_start_0, region.end):
+            if record.is_secondary or record.mapping_quality < mapq_threshold:
+                continue
+            hp_tag: CoverageHaplotype | None = None
+            with suppress(KeyError):
+                hp_tag = record.get_tag("HP")
+            if include_observed_haplotypes and hp_tag is not None and hp_tag not in hap_diffs:
+                hap_diffs[hp_tag] = [0] * (n_bins + 1)
+
+            for block_start, block_end in _merged_coverage_blocks(record, min_cigar_gap):
+                cov_start = max(block_start, region_start_0)
+                cov_end = min(block_end, region.end)
+                if cov_start < cov_end:
+                    bin_s = (cov_start - region_start_0) // bin_size
+                    bin_e = (cov_end - region_start_0 - 1) // bin_size + 1
+                    bin_s = max(0, min(bin_s, n_bins))
+                    bin_e = max(0, min(bin_e, n_bins))
+                    if bin_s < bin_e:
+                        total_diff[bin_s] += 1
+                        total_diff[bin_e] -= 1
+                        hp_key = hp_tag if hp_tag is not None else 0
+                        if hp_key in hap_diffs:
+                            hap_diffs[hp_key][bin_s] += 1
+                            hap_diffs[hp_key][bin_e] -= 1
+        bam.close()
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+
+    # Prefix-sum to get depths; build x/y lists
+    result: dict[CoverageHaplotype, tuple[list[int], list[int]]] = {}
+    x_vals = list(range(region.start, region.end + 1, bin_size))
+
+    depth = 0
+    y_total = []
+    for i in range(n_bins):
+        depth += total_diff[i]
+        y_total.append(max(0, depth))
+    result[-1] = (x_vals[: len(y_total)], y_total)
+
+    for hp, diff in hap_diffs.items():
+        depth = 0
+        y_hp = []
+        for i in range(n_bins):
+            depth += diff[i]
+            y_hp.append(max(0, depth))
+        result[hp] = (x_vals[: len(y_hp)], y_hp)
+
+    return result
+
+
 def order_alignments(segments_by_read):
     """
     Sort the split segments for each read by their fwd_read_start (ascending),
@@ -880,3 +1163,20 @@ def order_alignments(segments_by_read):
         segments.sort(key=lambda seg: seg.fwd_read_start)
         for i, seg in enumerate(segments, start=1):
             seg.alignment_order = i
+
+
+def fetch_reference_sequence(reference_path: str, region: Region) -> str | None:
+    """Return the reference sequence string for region, or None on any error.
+
+    Uses 0-based half-open coordinates internally (pysam convention).
+    Region coordinates are 1-based inclusive.
+    """
+    try:
+        with pysam.FastaFile(reference_path) as fasta:
+            if region.chromosome not in fasta.references:
+                return None
+            # region.start/end are 1-based inclusive; pysam.fetch is 0-based half-open
+            seq = fasta.fetch(region.chromosome, region.start - 1, region.end)
+            return seq.upper() if seq else None
+    except Exception:
+        return None

@@ -1,0 +1,824 @@
+(function () {
+    "use strict";
+
+    const OVERLAY_ID = "orographerReadConnectionOverlay";
+    const MARKER_RENDERER_NAME = "orographer_read_connector_marker";
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    const INITIAL_RETRY_LIMIT = 30;
+    const INITIAL_RETRY_DELAY_MS = 100;
+    const GUTTER_EXIT_PX = 10;
+    const LANE_SPACING_PX = 7;
+    const LONG_ROUTE_PANEL_SPANS = 1.5;
+    const TRANSIT_BAND_OFFSET_PX = 14;
+    const HIT_STROKE_WIDTH_PX = 14;
+    const HIT_RADIUS_PX = HIT_STROKE_WIDTH_PX / 2;
+    const CONNECTOR_LINE_COLOR = "lightgrey";
+    const CONNECTOR_SELECTION_LINE_COLOR = "#92400e";
+
+    function svgElement(tagName) {
+        if (document.createElementNS) {
+            return document.createElementNS(SVG_NS, tagName);
+        }
+        return document.createElement(tagName);
+    }
+
+    function ensureOverlay() {
+        let overlay = document.getElementById(OVERLAY_ID);
+        if (overlay) {
+            return overlay;
+        }
+
+        overlay = svgElement("svg");
+        overlay.setAttribute("id", OVERLAY_ID);
+        overlay.style.position = "fixed";
+        overlay.style.left = "0";
+        overlay.style.top = "0";
+        overlay.style.width = "100vw";
+        overlay.style.height = "100vh";
+        overlay.style.overflow = "visible";
+        overlay.style.pointerEvents = "none";
+        overlay.style.zIndex = "900";
+        document.body.appendChild(overlay);
+        return overlay;
+    }
+
+    function clearOverlay(overlay) {
+        while (overlay.firstChild) {
+            overlay.removeChild(overlay.firstChild);
+        }
+    }
+
+    function selectableSources() {
+        const sources = [];
+        const seen = new Set();
+        function addSource(source) {
+            if (!source) {
+                return;
+            }
+            if (!source.data) {
+                return;
+            }
+            if (!source.data.read_name) {
+                return;
+            }
+            if (!source.data.source_kind) {
+                return;
+            }
+            const sourceKind = source.data.source_kind[0];
+            if (sourceKind !== "arrow" && sourceKind !== "connector") {
+                return;
+            }
+            if (!source.selected) {
+                return;
+            }
+            if (!source.change) {
+                return;
+            }
+            if (seen.has(source)) {
+                return;
+            }
+            seen.add(source);
+            sources.push(source);
+        }
+
+        const configuredSources = window.orographerSelectableSources || [];
+        configuredSources.forEach(addSource);
+        const bokeh = window.Bokeh;
+        if (!bokeh) {
+            return sources;
+        }
+        if (!bokeh.documents) {
+            return sources;
+        }
+        bokeh.documents.forEach(function (doc) {
+            if (!doc._all_models) {
+                return;
+            }
+            doc._all_models.forEach(function (model) {
+                addSource(model);
+                addSource(model.data_source);
+            });
+        });
+        return sources;
+    }
+
+    function matchingReadIndices(source, readName) {
+        const matches = [];
+        if (!source.data.read_name) {
+            return matches;
+        }
+        source.data.read_name.forEach(function (candidateReadName, rowIndex) {
+            if (candidateReadName === readName) {
+                matches.push(rowIndex);
+            }
+        });
+        return matches;
+    }
+
+    function readIsSelected(sources, readName) {
+        return sources.some(function (source) {
+            const selectedIndices = source.selected ? source.selected.indices : [];
+            const matches = matchingReadIndices(source, readName);
+            return matches.some(function (rowIndex) {
+                return selectedIndices.indexOf(rowIndex) !== -1;
+            });
+        });
+    }
+
+    function setReadSelection(readName, shouldSelect) {
+        const sources = selectableSources();
+        sources.forEach(function (source) {
+            const matches = matchingReadIndices(source, readName);
+            if (matches.length === 0) {
+                return;
+            }
+            const selectedIndices = source.selected ? source.selected.indices.slice() : [];
+            let nextIndices = [];
+            if (shouldSelect) {
+                nextIndices = selectedIndices.slice();
+                matches.forEach(function (rowIndex) {
+                    if (nextIndices.indexOf(rowIndex) === -1) {
+                        nextIndices.push(rowIndex);
+                    }
+                });
+            } else {
+                nextIndices = selectedIndices.filter(function (rowIndex) {
+                    return matches.indexOf(rowIndex) === -1;
+                });
+            }
+            source.selected.indices = nextIndices;
+            source._lastNonEmpty = nextIndices.slice();
+            source.change.emit();
+        });
+    }
+
+    function toggleReadSelection(readName) {
+        const sources = selectableSources();
+        const shouldSelect = readIsSelected(sources, readName) ? false : true;
+        setReadSelection(readName, shouldSelect);
+        window.orographerUpdateReadConnectionOverlay();
+    }
+
+    function eachCollectionItem(collection, seen, callback) {
+        if (!collection) {
+            return;
+        }
+        if (collection[Symbol.iterator]) {
+            for (const item of collection) {
+                eachNestedView(item, seen, callback);
+                if (item) {
+                    eachNestedView(item.data, seen, callback);
+                }
+            }
+            return;
+        }
+        Object.values(collection).forEach(function (child) {
+            eachNestedView(child, seen, callback);
+        });
+    }
+
+    function eachNestedView(value, seen, callback) {
+        if (!value) {
+            return;
+        }
+        if (typeof value !== "object") {
+            return;
+        }
+        if (seen.has(value)) {
+            return;
+        }
+        seen.add(value);
+        callback(value);
+
+        const childViews = value.child_views;
+        if (childViews) {
+            eachCollectionItem(childViews, seen, callback);
+        }
+        const views = value.views;
+        if (views) {
+            eachCollectionItem(views, seen, callback);
+        }
+        const privateChildViews = value._child_views;
+        if (privateChildViews) {
+            eachCollectionItem(privateChildViews, seen, callback);
+        }
+        const elementViews = value._element_views;
+        if (elementViews) {
+            eachCollectionItem(elementViews, seen, callback);
+        }
+        const rendererViews = value.renderer_views;
+        if (rendererViews) {
+            eachCollectionItem(rendererViews, seen, callback);
+        }
+        const layoutChildren = value.layout ? value.layout.children : null;
+        if (layoutChildren) {
+            eachCollectionItem(layoutChildren, seen, callback);
+        }
+    }
+
+    function connectorMarkerViews() {
+        const bokeh = window.Bokeh;
+        if (!bokeh) {
+            return [];
+        }
+        if (!bokeh.index) {
+            return [];
+        }
+
+        const views = [];
+        Object.values(bokeh.index).forEach(function (rootView) {
+            eachNestedView(rootView, new Set(), function (view) {
+                const model = view.model;
+                const isConnector =
+                    model ? model.name === MARKER_RENDERER_NAME : false;
+                if (isConnector) {
+                    views.push(view);
+                }
+            });
+        });
+        return views;
+    }
+
+    function connectorMarkerModels() {
+        const bokeh = window.Bokeh;
+        if (!bokeh) {
+            return [];
+        }
+        if (!bokeh.documents) {
+            return [];
+        }
+        const models = [];
+        bokeh.documents.forEach(function (doc) {
+            if (!doc._all_models) {
+                return;
+            }
+            doc._all_models.forEach(function (model) {
+                if (model.name === MARKER_RENDERER_NAME) {
+                    models.push(model);
+                }
+            });
+        });
+        return models;
+    }
+
+    function queryDeep(selector) {
+        const matches = [];
+        const seen = new Set();
+        function visit(root) {
+            if (!root) {
+                return;
+            }
+            if (!root.querySelectorAll) {
+                return;
+            }
+            root.querySelectorAll(selector).forEach(function (element) {
+                if (!seen.has(element)) {
+                    seen.add(element);
+                    matches.push(element);
+                }
+            });
+            root.querySelectorAll("*").forEach(function (element) {
+                if (element.shadowRoot) {
+                    visit(element.shadowRoot);
+                }
+            });
+        }
+        visit(document);
+        return matches;
+    }
+
+    function rectToPlain(rect) {
+        return {
+            left: rect.left,
+            top: rect.top,
+            width: rect.width,
+            height: rect.height,
+        };
+    }
+
+    function visibleElements(elements) {
+        return elements.filter(function (element) {
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+        });
+    }
+
+    function plotModelById(modelId) {
+        const bokeh = window.Bokeh;
+        if (!bokeh) {
+            return null;
+        }
+        if (!bokeh.documents) {
+            return null;
+        }
+        let found = null;
+        bokeh.documents.forEach(function (doc) {
+            if (found) {
+                return;
+            }
+            if (!doc._all_models) {
+                return;
+            }
+            found = doc._all_models.get(modelId);
+        });
+        return found;
+    }
+
+    function plotFrameRect(plotElement) {
+        const leftPanels = queryDeepWithin(plotElement, ".bk-CanvasPanel.bk-left");
+        const abovePanels = queryDeepWithin(plotElement, ".bk-CanvasPanel.bk-above");
+        const rightPanels = queryDeepWithin(plotElement, ".bk-CanvasPanel.bk-right");
+        const tallLeftPanels = leftPanels.filter(function (panel) {
+            return panel.getBoundingClientRect().height > 10;
+        });
+        if (tallLeftPanels.length === 0) {
+            return rectToPlain(plotElement.getBoundingClientRect());
+        }
+        const leftPanel = tallLeftPanels[0].getBoundingClientRect();
+        const wideAbovePanels = abovePanels.filter(function (panel) {
+            return panel.getBoundingClientRect().width > 10;
+        });
+        const rightPanel = rightPanels.find(function (panel) {
+            return panel.getBoundingClientRect().height > 10;
+        });
+        const abovePanel = wideAbovePanels.length === 0 ? null : wideAbovePanels[0];
+        const aboveRect = abovePanel ? abovePanel.getBoundingClientRect() : null;
+        const rightRect = rightPanel ? rightPanel.getBoundingClientRect() : null;
+        const frameLeft = leftPanel.right;
+        const frameRight = rightRect ? rightRect.left : plotElement.getBoundingClientRect().right;
+        return {
+            left: frameLeft,
+            top: leftPanel.top,
+            width: aboveRect ? aboveRect.width : frameRight - frameLeft,
+            height: leftPanel.height,
+        };
+    }
+
+    function queryDeepWithin(element, selector) {
+        const matches = [];
+        const seen = new Set();
+        function visit(root) {
+            if (!root) {
+                return;
+            }
+            if (!root.querySelectorAll) {
+                return;
+            }
+            root.querySelectorAll(selector).forEach(function (match) {
+                if (!seen.has(match)) {
+                    seen.add(match);
+                    matches.push(match);
+                }
+            });
+            root.querySelectorAll("*").forEach(function (child) {
+                if (child.shadowRoot) {
+                    visit(child.shadowRoot);
+                }
+            });
+        }
+        if (element.shadowRoot) {
+            visit(element.shadowRoot);
+        }
+        visit(element);
+        return matches;
+    }
+
+    function endpointPositionFromSource(source, rowIndex) {
+        const data = source.data;
+        if (data.read_filter_alpha) {
+            if (!data.read_filter_alpha[rowIndex]) {
+                return null;
+            }
+        }
+        if (!data.plot_dom_class) {
+            return null;
+        }
+        const domClass = data.plot_dom_class[rowIndex];
+        const plotElements = visibleElements(queryDeep("." + domClass));
+        if (plotElements.length === 0) {
+            return null;
+        }
+        const plotModel = plotModelById(data.plot_model_id[rowIndex]);
+        if (!plotModel) {
+            return null;
+        }
+        const frame = plotFrameRect(plotElements[0]);
+        const xRange = plotModel.x_range;
+        const yRange = plotModel.y_range;
+        const xSpan = xRange.end - xRange.start;
+        const ySpan = yRange.start - yRange.end;
+        if (xSpan === 0 || ySpan === 0) {
+            return null;
+        }
+        const x = data.marker_x[rowIndex];
+        const y = data.y[rowIndex];
+        const xFrac = (x - xRange.start) / xSpan;
+        const yFrac = (y - yRange.end) / ySpan;
+        return {
+            x: frame.left + frame.width * xFrac,
+            y: frame.top + frame.height * yFrac,
+            dataX: x,
+            dataY: y,
+            frame: frame,
+            xRange: {
+                start: xRange.start,
+                end: xRange.end,
+            },
+            yRange: {
+                start: yRange.start,
+                end: yRange.end,
+            },
+            plotDomClass: domClass,
+            plotModelId: data.plot_model_id[rowIndex],
+            readName: data.read_name[rowIndex],
+            connectionId: data.connection_id[rowIndex],
+            connectionScope: data.connection_scope
+                ? data.connection_scope[rowIndex]
+                : "cross_region",
+            transition: data.haplotype_transition[rowIndex],
+            selected: source.selected.indices.indexOf(rowIndex) !== -1,
+        };
+    }
+
+    function endpointPosition(view, rowIndex) {
+        const source = view.model.data_source;
+        const data = source.data;
+        if (data.read_filter_alpha) {
+            if (!data.read_filter_alpha[rowIndex]) {
+                return null;
+            }
+        }
+        const plotView = view.plot_view;
+        const frame = plotView ? plotView.frame : null;
+        const canvasView = plotView ? plotView.canvas_view : null;
+        const eventsEl = canvasView ? canvasView.events_el : null;
+        if (!frame) {
+            return null;
+        }
+        if (!eventsEl) {
+            return null;
+        }
+
+        const xScale = frame.x_scale;
+        const yScale = frame.y_scale;
+        if (!xScale) {
+            return null;
+        }
+        if (!yScale) {
+            return null;
+        }
+
+        const x = data.marker_x[rowIndex];
+        const y = data.y[rowIndex];
+        const screenX = xScale.compute(x);
+        const screenY = yScale.compute(y);
+        const rect = eventsEl.getBoundingClientRect();
+        return {
+            x: rect.left + screenX,
+            y: rect.top + screenY,
+            dataX: x,
+            dataY: y,
+            frame: {
+                left: rect.left,
+                top: rect.top,
+                width: rect.width,
+                height: rect.height,
+            },
+            xRange: {},
+            yRange: {},
+            plotDomClass: "",
+            plotModelId: "",
+            readName: data.read_name[rowIndex],
+            connectionId: data.connection_id[rowIndex],
+            connectionScope: data.connection_scope
+                ? data.connection_scope[rowIndex]
+                : "cross_region",
+            transition: data.haplotype_transition[rowIndex],
+            selected: source.selected.indices.indexOf(rowIndex) !== -1,
+        };
+    }
+
+    function appendEndpoint(endpoints, endpoint) {
+        if (!endpoint) {
+            return;
+        }
+        if (!endpoint.connectionId) {
+            return;
+        }
+        if (endpoint.connectionScope === "same_region") {
+            return;
+        }
+        if (!endpoints[endpoint.connectionId]) {
+            endpoints[endpoint.connectionId] = [];
+        }
+        endpoints[endpoint.connectionId].push(endpoint);
+    }
+
+    function endpointsByConnectionFromViews() {
+        const endpoints = {};
+        connectorMarkerViews().forEach(function (view) {
+            const source = view.model.data_source;
+            source.data.connection_id.forEach(function (_connectionId, rowIndex) {
+                appendEndpoint(endpoints, endpointPosition(view, rowIndex));
+            });
+        });
+        return endpoints;
+    }
+
+    function endpointsByConnectionFromModels() {
+        const endpoints = {};
+        connectorMarkerModels().forEach(function (model) {
+            const source = model.data_source;
+            source.data.connection_id.forEach(function (_connectionId, rowIndex) {
+                appendEndpoint(endpoints, endpointPositionFromSource(source, rowIndex));
+            });
+        });
+        return endpoints;
+    }
+
+    function laneOffset(index) {
+        const lane = index % 7;
+        return (lane - 3) * LANE_SPACING_PX;
+    }
+
+    function endpointSide(endpoint, direction) {
+        return direction > 0 ? endpoint.frame.left + endpoint.frame.width : endpoint.frame.left;
+    }
+
+    function routedPathData(firstEndpoint, secondEndpoint, index) {
+        const direction = secondEndpoint.x >= firstEndpoint.x ? 1 : -1;
+        const offset = laneOffset(index);
+        const firstExitX = endpointSide(firstEndpoint, direction) + direction * GUTTER_EXIT_PX;
+        const secondEntryX =
+            endpointSide(secondEndpoint, -direction) - direction * GUTTER_EXIT_PX;
+        const panelDelta = Math.abs(secondEndpoint.frame.left - firstEndpoint.frame.left);
+        const panelSpan = Math.max(firstEndpoint.frame.width, secondEndpoint.frame.width);
+        const isLongRoute = panelDelta > panelSpan * LONG_ROUTE_PANEL_SPANS;
+
+        if (isLongRoute) {
+            const transitBase = Math.min(firstEndpoint.frame.top, secondEndpoint.frame.top);
+            const transitY = Math.max(6, transitBase - TRANSIT_BAND_OFFSET_PX - Math.abs(offset));
+            return [
+                "M", firstEndpoint.x, firstEndpoint.y,
+                "L", firstExitX, firstEndpoint.y,
+                "L", firstExitX, transitY,
+                "L", secondEntryX, transitY,
+                "L", secondEntryX, secondEndpoint.y,
+                "L", secondEndpoint.x, secondEndpoint.y,
+            ].join(" ");
+        }
+
+        const gutterX = (firstExitX + secondEntryX) / 2 + offset;
+        return [
+            "M", firstEndpoint.x, firstEndpoint.y,
+            "L", firstExitX, firstEndpoint.y,
+            "L", gutterX, firstEndpoint.y,
+            "L", gutterX, secondEndpoint.y,
+            "L", secondEntryX, secondEndpoint.y,
+            "L", secondEndpoint.x, secondEndpoint.y,
+        ].join(" ");
+    }
+
+    function pathNumberTokens(pathData) {
+        const numbers = [];
+        pathData.split(" ").forEach(function (token) {
+            const value = Number(token);
+            if (Number.isFinite(value)) {
+                numbers.push(value);
+            }
+        });
+        return numbers;
+    }
+
+    function distanceToSegmentPx(x, y, x0, y0, x1, y1) {
+        const dx = x1 - x0;
+        const dy = y1 - y0;
+        const len2 = dx * dx + dy * dy;
+        let t = 0;
+        if (len2 !== 0) {
+            t = ((x - x0) * dx + (y - y0) * dy) / len2;
+            if (Math.sign(0 - t) === 1) {
+                t = 0;
+            }
+            if (Math.sign(t - 1) === 1) {
+                t = 1;
+            }
+        }
+        const projX = x0 + t * dx;
+        const projY = y0 + t * dy;
+        const distX = x - projX;
+        const distY = y - projY;
+        return Math.sqrt(distX * distX + distY * distY);
+    }
+
+    function routeHitReadName(x, y) {
+        const selector =
+            "#" + OVERLAY_ID + " .orographer-read-connection-overlay-line";
+        const paths = Array.from(document.querySelectorAll(selector));
+        let bestReadName = null;
+        let bestDistance = Infinity;
+        paths.forEach(function (path) {
+            const numbers = pathNumberTokens(path.getAttribute("d") || "");
+            for (let idx = 2; idx <= numbers.length - 2; idx += 2) {
+                const distance = distanceToSegmentPx(
+                    x,
+                    y,
+                    numbers[idx - 2],
+                    numbers[idx - 1],
+                    numbers[idx],
+                    numbers[idx + 1],
+                );
+                if (Math.sign(bestDistance - distance) === 1) {
+                    bestDistance = distance;
+                    bestReadName = path.getAttribute("data-read-name");
+                }
+            }
+        });
+        return Math.sign(HIT_RADIUS_PX - bestDistance) + 1 ? bestReadName : null;
+    }
+
+    function handleOverlayClick(event) {
+        if (!event) {
+            return;
+        }
+        const modal = document.getElementById("alignmentModal");
+        if (modal) {
+            const modalVisible = modal.style.display === "flex";
+            const targetInsideModal = modal.contains ? modal.contains(event.target) : false;
+            if (modalVisible && targetInsideModal) {
+                return;
+            }
+        }
+        const readName = routeHitReadName(event.clientX, event.clientY);
+        if (!readName) {
+            return;
+        }
+        if (event.preventDefault) {
+            event.preventDefault();
+        }
+        if (event.stopPropagation) {
+            event.stopPropagation();
+        }
+        if (event.stopImmediatePropagation) {
+            event.stopImmediatePropagation();
+        }
+        toggleReadSelection(readName);
+    }
+
+    function addRoutedPath(overlay, connectionId, firstEndpoint, secondEndpoint, index) {
+        const isSelected = firstEndpoint.selected || secondEndpoint.selected;
+        const readName = firstEndpoint.readName || secondEndpoint.readName;
+        const pathData = routedPathData(firstEndpoint, secondEndpoint, index);
+        const group = svgElement("g");
+        group.setAttribute("data-connection-id", connectionId);
+        group.setAttribute("data-read-name", readName);
+        group.setAttribute("data-x1", String(firstEndpoint.x));
+        group.setAttribute("data-y1", String(firstEndpoint.y));
+        group.setAttribute("data-x2", String(secondEndpoint.x));
+        group.setAttribute("data-y2", String(secondEndpoint.y));
+        group.setAttribute("class", "orographer-read-connection-overlay-route");
+        group.style.cursor = "pointer";
+
+        const path = svgElement("path");
+        path.setAttribute("d", pathData);
+        path.setAttribute("data-x1", String(firstEndpoint.x));
+        path.setAttribute("data-y1", String(firstEndpoint.y));
+        path.setAttribute("data-x2", String(secondEndpoint.x));
+        path.setAttribute("data-y2", String(secondEndpoint.y));
+        path.setAttribute("data-connection-id", connectionId);
+        path.setAttribute("data-read-name", readName);
+        path.setAttribute("class", "orographer-read-connection-overlay-line");
+        path.setAttribute("fill", "none");
+        path.setAttribute("stroke-linecap", "round");
+        path.setAttribute("stroke-linejoin", "round");
+        path.setAttribute("stroke-width", isSelected ? "2.75" : "1.25");
+        path.setAttribute("stroke-opacity", isSelected ? "0.84" : "0.22");
+        path.style.pointerEvents = "none";
+
+        const hitPath = svgElement("path");
+        hitPath.setAttribute("d", pathData);
+        hitPath.setAttribute("data-connection-id", connectionId);
+        hitPath.setAttribute("data-read-name", readName);
+        hitPath.setAttribute("class", "orographer-read-connection-overlay-hit-area");
+        hitPath.setAttribute("fill", "none");
+        hitPath.setAttribute("stroke", "#000000");
+        hitPath.setAttribute("stroke-linecap", "round");
+        hitPath.setAttribute("stroke-linejoin", "round");
+        hitPath.setAttribute("stroke-width", String(HIT_STROKE_WIDTH_PX));
+        hitPath.setAttribute("stroke-opacity", "0.001");
+        hitPath.style.pointerEvents = "stroke";
+
+        const handleClick = function (event) {
+            if (event) {
+                if (event.preventDefault) {
+                    event.preventDefault();
+                }
+                if (event.stopPropagation) {
+                    event.stopPropagation();
+                }
+            }
+            toggleReadSelection(readName);
+        };
+        group.addEventListener("click", handleClick);
+        path.setAttribute(
+            "stroke",
+            isSelected ? CONNECTOR_SELECTION_LINE_COLOR : CONNECTOR_LINE_COLOR,
+        );
+        if (firstEndpoint.transition || secondEndpoint.transition) {
+            path.setAttribute("stroke-dasharray", isSelected ? "6 4" : "4 5");
+        }
+        if (isSelected) {
+            path.setAttribute("data-selected", "true");
+        }
+        group.appendChild(path);
+        group.appendChild(hitPath);
+        overlay.appendChild(group);
+    }
+
+    function currentEndpointsByConnection() {
+        let endpoints = endpointsByConnectionFromViews();
+        if (Object.keys(endpoints).length === 0) {
+            endpoints = endpointsByConnectionFromModels();
+        }
+        return endpoints;
+    }
+
+    window.orographerUpdateReadConnectionOverlay = function () {
+        const overlay = ensureOverlay();
+        clearOverlay(overlay);
+        const endpoints = currentEndpointsByConnection();
+        const routes = [];
+        Object.keys(endpoints).sort().forEach(function (connectionId, index) {
+            const pair = endpoints[connectionId];
+            if (pair.length <= 1) {
+                return;
+            }
+            routes.push({
+                connectionId: connectionId,
+                pair: pair,
+                index: index,
+                selected: pair[0].selected || pair[1].selected,
+            });
+        });
+        routes.sort(function (firstRoute, secondRoute) {
+            return Number(firstRoute.selected) - Number(secondRoute.selected);
+        });
+        routes.forEach(function (route) {
+            addRoutedPath(
+                overlay,
+                route.connectionId,
+                route.pair[0],
+                route.pair[1],
+                route.index,
+            );
+        });
+        return overlay.children.length;
+    };
+
+    window.orographerReadConnectionDebugState = function () {
+        const endpoints = currentEndpointsByConnection();
+        const lines = Array.from(
+            document.querySelectorAll(
+                "#" + OVERLAY_ID + " .orographer-read-connection-overlay-line",
+            ),
+        ).map(function (path) {
+            return {
+                connectionId: path.getAttribute("data-connection-id"),
+                x1: Number(path.getAttribute("data-x1")),
+                y1: Number(path.getAttribute("data-y1")),
+                x2: Number(path.getAttribute("data-x2")),
+                y2: Number(path.getAttribute("data-y2")),
+                opacity: path.getAttribute("stroke-opacity"),
+                d: path.getAttribute("d"),
+            };
+        });
+        return {
+            endpoints: endpoints,
+            lines: lines,
+        };
+    };
+
+    function scheduleInitialOverlayUpdate(attempt) {
+        if (!window.setTimeout) {
+            return;
+        }
+        window.setTimeout(function () {
+            const lineCount = window.orographerUpdateReadConnectionOverlay();
+            if (lineCount !== 0) {
+                return;
+            }
+            if (attempt >= INITIAL_RETRY_LIMIT) {
+                return;
+            }
+            scheduleInitialOverlayUpdate(attempt + 1);
+        }, INITIAL_RETRY_DELAY_MS);
+    }
+
+    if (!window.orographerReadConnectionOverlayInstalled) {
+        window.orographerReadConnectionOverlayInstalled = true;
+        window.addEventListener("click", handleOverlayClick, true);
+        window.addEventListener("resize", window.orographerUpdateReadConnectionOverlay);
+        window.addEventListener("scroll", window.orographerUpdateReadConnectionOverlay, true);
+        scheduleInitialOverlayUpdate(0);
+    }
+}());

@@ -7,11 +7,22 @@ import sys
 
 from .__init__ import __version__
 from .bam_parser import validate_bam_file
+from .complex_sv import DEFAULT_REGION_CONNECTION_THRESHOLD
 from .deploy import run_deploy
 from .orographer import orographer
-from .utils import ALLOWED_REGION_TYPES, OutputConfig, parse_coordinate
+from .utils import (
+    ISOSEQ_REGION_TYPE,
+    OutputConfig,
+    get_allowed_region_types,
+    parse_coordinate,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _format_region_type_choices(region_types: list[str]) -> str:
+    """Return an argparse-style choice label without exposing hidden modes."""
+    return "{" + ",".join(region_types) + "}"
 
 
 def setup_args():
@@ -46,7 +57,7 @@ def setup_args():
         epilog="""
 Examples:
   orographer plot --bam input.bam --coord chr1:1000-2000 --region-type \\
-      complex_sv --ref ref.fa --outdir ./output
+      paraphase --ref ref.fa --outdir ./output
   orographer plot --bam /path/to/file.bam --coord chrX:50000-60000 \\
       --region-type paraphase --ref ref.fa --outdir ./output
         """,
@@ -71,7 +82,7 @@ Examples:
     plot_parser.add_argument(
         "--region-type",
         help="Region type to plot",
-        choices=ALLOWED_REGION_TYPES,
+        metavar=_format_region_type_choices(get_allowed_region_types()),
         required=True,
     )
 
@@ -155,6 +166,55 @@ Examples:
     )
 
     plot_parser.add_argument(
+        "--no-dotplot",
+        help="Disable reference self-identity dotplot sub-figure.",
+        required=False,
+        default=False,
+        action="store_true",
+        dest="no_dotplot",
+    )
+
+    plot_parser.add_argument(
+        "--region-connection-threshold",
+        help=argparse.SUPPRESS,
+        required=False,
+        default=DEFAULT_REGION_CONNECTION_THRESHOLD,
+        type=int,
+    )
+
+    plot_parser.add_argument(
+        "--no-expansion",
+        help=argparse.SUPPRESS,
+        required=False,
+        default=False,
+        action="store_true",
+    )
+
+    plot_parser.add_argument(
+        "--force-isoseq",
+        help=argparse.SUPPRESS,
+        required=False,
+        default=False,
+        action="store_true",
+    )
+
+    plot_parser.add_argument(
+        "--enable-experimental-isoseq",
+        help=argparse.SUPPRESS,
+        required=False,
+        default=False,
+        action="store_true",
+    )
+
+    plot_parser.add_argument(
+        "--enable-experimental-region-types",
+        help=argparse.SUPPRESS,
+        required=False,
+        default=False,
+        action="store_true",
+    )
+
+    plot_parser.add_argument(
         "--verbose",
         help="Write verbose output to stderr.",
         required=False,
@@ -186,8 +246,19 @@ Examples:
     # Parse arguments
     args = parser.parse_args()
 
-    # Validate prefix and multi-BAM args (for plot command)
+    # Validate plot args that depend on multiple parser values.
     if args.command == "plot":
+        include_experimental = (
+            args.enable_experimental_region_types or args.enable_experimental_isoseq
+        )
+        allowed_region_types = get_allowed_region_types(include_experimental)
+        if args.region_type not in allowed_region_types:
+            public_region_types = ", ".join(get_allowed_region_types())
+            parser.error(f"--region-type must be one of: {public_region_types}.")
+        if args.force_isoseq and not include_experimental:
+            parser.error("--force-isoseq requires --enable-experimental-region-types.")
+        if args.force_isoseq and args.region_type != ISOSEQ_REGION_TYPE:
+            parser.error("--force-isoseq can only be used with --region-type isoseq.")
         if args.prefix is not None and not re.match(r"^[a-zA-Z0-9_]+$", args.prefix):
             parser.error(
                 "--prefix must be alphanumeric with underscores "
@@ -208,6 +279,10 @@ Examples:
                 f"(expected {len(other_bam_list)} labels for {len(other_bam_list)} "
                 f"other BAMs, got {len(other_sample_label_list)})."
             )
+        if args.region_connection_threshold < 1:
+            parser.error("--region-connection-threshold must be at least 1.")
+        if args.region_type == ISOSEQ_REGION_TYPE and not args.gtf:
+            parser.error("--gtf is required when --region-type isoseq.")
 
     return args
 
@@ -255,19 +330,27 @@ def run_plot_command(args):
         )
 
     output_config = OutputConfig(args.outdir, args.prefix)
-    orographer(
-        args.region_type,
-        args.bam,
-        coords,
-        args.ref,
-        output_config,
-        args.gtf,
-        args.vcf,
-        other_bam_list,
-        other_vcf_list,
-        args.sample_label,
-        other_sample_label_list,
-    )
+    try:
+        orographer(
+            args.region_type,
+            args.bam,
+            coords,
+            args.ref,
+            output_config,
+            args.gtf,
+            args.vcf,
+            other_bam_list,
+            other_vcf_list,
+            args.sample_label,
+            other_sample_label_list,
+            show_dotplot=not args.no_dotplot,
+            region_connection_threshold=args.region_connection_threshold,
+            no_expansion=args.no_expansion,
+            force_isoseq=getattr(args, "force_isoseq", False),
+        )
+    except ValueError as err:
+        logger.error(str(err))
+        sys.exit(1)
 
 
 def run_deploy_command(args):

@@ -48,10 +48,15 @@ def get_arrow_tap_callback_multi_region(arrow_source, all_arrow_sources):
     )
 
 
-def get_number_click_callback(source):
+def get_read_connection_overlay_callback():
+    """Get JS callback that redraws selected explicit read connections."""
+    return CustomJS(code=load_javascript("read_connection_overlay_callback.js"))
+
+
+def get_number_click_callback(source, all_sources=None):
     """Get JavaScript callback for number label clicks (shows modal)."""
     return CustomJS(
-        args={"source": source},
+        args={"source": source, "all_sources": all_sources or [source]},
         code=load_javascript("number_click_callback.js"),
     )
 
@@ -76,12 +81,15 @@ def get_modal_html():
         dialog_css,
         '">\n                <span id="closeModal" style="',
         close_css,
-        '">&times;</span>\n                <h2 style="margin-top: 0; color: #333;">'
+        '">&times;</span>\n                <h2 id="alignmentModalTitle" '
+        'style="margin-top: 0; color: #333;">'
         'Details</h2>\n                <div id="modalContent" '
         'style="font-size: 14px; line-height: 1.8;"></div>\n            '
         "</div>\n        ",
         "</div>\n    </div>\n    \n    <script>\n    ",
         load_javascript("modal.js"),
+        "\n    </script>\n    <script>\n    ",
+        load_javascript("read_connection_overlay.js"),
         "\n    </script>\n    ",
     ]
     return "".join(parts)

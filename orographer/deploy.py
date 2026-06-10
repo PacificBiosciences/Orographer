@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 class PlotHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     """Simple HTTP handler for serving plot files."""
 
-    def end_headers(self):
+    def end_headers(self) -> None:
         # Add CORS headers to allow local file access
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
