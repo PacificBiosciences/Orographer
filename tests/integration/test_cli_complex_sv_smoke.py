@@ -5,8 +5,7 @@ import sys
 from pathlib import Path
 
 from tests.helpers.plot_json_schema import (
-    assert_genomic_ranges_in_docs_json,
-    assert_orig_region_bounds_in_docs_json,
+    collect_genomic_like_start_end_pairs,
     validate_plot_json_schema,
 )
 
@@ -43,6 +42,7 @@ def test_cli_complex_sv_creates_outputs(tmp_path: Path):
         "-m",
         "orographer",
         "plot",
+        "--enable-experimental-region-types",
         "--bam",
         str(bam_path),
         "--coord",
@@ -68,7 +68,17 @@ def test_cli_complex_sv_creates_outputs(tmp_path: Path):
         data = json.load(f)
 
     validate_plot_json_schema(data)
+
+    # BFS discovery expands regions by 10%+, so the output regions will not match
+    # the exact seed coordinates. Assert that at least one genomic-scale x-range
+    # is present and that it contains the seed region.
     _chrom, rest = coord.split(":")
     start_1, end_1 = int(rest.split("-")[0]), int(rest.split("-")[1])
-    assert_orig_region_bounds_in_docs_json(data["docs_json"], [(start_1, end_1)])
-    assert_genomic_ranges_in_docs_json(data["docs_json"], [(start_1, end_1)])
+    genomic_ranges = collect_genomic_like_start_end_pairs(data["docs_json"])
+    assert genomic_ranges, "No genomic-scale x-ranges found in output JSON"
+    # At least one output region should span the seed (BFS only expands outward)
+    containing = [(s, e) for s, e in genomic_ranges if s <= start_1 and e >= end_1]
+    assert containing, (
+        f"No output region contains the seed {start_1}-{end_1}. "
+        f"Output ranges: {sorted(genomic_ranges)}"
+    )

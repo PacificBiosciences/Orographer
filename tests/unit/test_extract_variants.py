@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pysam
 
-from orographer.bam_parser import extract_variants
+from orographer.bam_parser import extract_variants, insertion_query_positions_from_cigar
 
 
 def _write_fasta(tmp_path: Path, ref_name: str, ref_seq: str) -> Path:
@@ -30,6 +30,7 @@ def _write_single_record_bam(
       - 0: M
       - 1: I
       - 2: D
+      - 4: S
     """
 
     bam_path = tmp_path / "test.bam"
@@ -110,6 +111,61 @@ def test_extract_variants_insertion(tmp_path: Path):
     assert deletions == []
     # insertion_start_ref uses last_ref_pos from aligned_pairs; after 2M it's ref_pos=1
     assert insertions == [(1, "T")]
+
+
+def test_extract_variants_soft_clip_does_not_create_insertion(tmp_path: Path):
+    ref_name = "chr1"
+    ref_seq = "AAAAA"
+
+    fasta_path = _write_fasta(tmp_path, ref_name, ref_seq)
+    bam_path = _write_single_record_bam(
+        tmp_path=tmp_path,
+        ref_name=ref_name,
+        ref_seq=ref_seq,
+        query_name="q1",
+        query_seq="AAAAATTTT",
+        reference_start=0,
+        cigartuples=[(0, 5), (4, 4)],  # 5M4S
+    )
+    rec = _load_first_record(bam_path)
+    ref_fa = pysam.FastaFile(str(fasta_path))
+
+    mismatches, insertions, deletions = extract_variants(rec, ref_fa)
+
+    assert mismatches == []
+    assert insertions == []
+    assert deletions == []
+
+
+def test_extract_variants_keeps_true_insertion_before_soft_clip(tmp_path: Path):
+    ref_name = "chr1"
+    ref_seq = "AAAAA"
+
+    fasta_path = _write_fasta(tmp_path, ref_name, ref_seq)
+    bam_path = _write_single_record_bam(
+        tmp_path=tmp_path,
+        ref_name=ref_name,
+        ref_seq=ref_seq,
+        query_name="q1",
+        query_seq="AATAAACC",
+        reference_start=0,
+        cigartuples=[(0, 2), (1, 1), (0, 3), (4, 2)],  # 2M1I3M2S
+    )
+    rec = _load_first_record(bam_path)
+    ref_fa = pysam.FastaFile(str(fasta_path))
+
+    mismatches, insertions, deletions = extract_variants(rec, ref_fa)
+
+    assert mismatches == []
+    assert insertions == [(1, "T")]
+    assert deletions == []
+
+
+def test_insertion_query_positions_from_cigar_excludes_soft_clips() -> None:
+    assert insertion_query_positions_from_cigar([(4, 3), (0, 2), (1, 2), (4, 5)]) == {
+        5,
+        6,
+    }
 
 
 def test_extract_variants_deletion(tmp_path: Path):

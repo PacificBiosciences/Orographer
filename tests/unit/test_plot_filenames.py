@@ -69,3 +69,16 @@ def test_generate_multi_region_filename_without_prefix(tmp_path: Path):
 
     expected_file = "2_1_2_chr3_5_6_bokeh.html"
     assert out == str(tmp_path / expected_file)
+
+
+def test_generate_multi_region_filename_strips_coordinate_commas(tmp_path: Path):
+    region = Region("chr8", 127_000_000, 146_000_000, "chr8:127,000,000-146,000,000")
+    region_data_list = [{"region": region}]
+
+    out = generate_multi_region_filename(
+        region_data_list=region_data_list,
+        output_dir=str(tmp_path),
+        prefix=None,
+    )
+
+    assert out == str(tmp_path / "chr8_127000000_146000000_bokeh.html")

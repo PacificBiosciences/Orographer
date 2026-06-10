@@ -1,5 +1,6 @@
 import pytest
 
+from orographer.plot_bokeh.utils import build_haplotype_color_map
 from orographer.utils import parse_coordinate
 
 
@@ -8,6 +9,19 @@ def test_parse_coordinate_valid():
     assert chrom == "chr1"
     assert start == 1
     assert end == 2
+
+
+def test_parse_coordinate_strips_commas():
+    chrom, start, end = parse_coordinate("chr8:127,000,000-146,000,000")
+    assert chrom == "chr8"
+    assert start == 127_000_000
+    assert end == 146_000_000
+
+
+def test_build_haplotype_color_map_avoids_named_haplotype_collisions():
+    color_map = build_haplotype_color_map(["smn1_smn2hap1", "smn1_smn2hap2"])
+
+    assert color_map["smn1_smn2hap1"] != color_map["smn1_smn2hap2"]
 
 
 @pytest.mark.parametrize(
