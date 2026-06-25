@@ -37,8 +37,8 @@ function countValue(column, fallback) {
 let html = "";
 html += LT + "p" + GT + LT + "strong" + GT + "Feature:" + LT + "/strong" + GT
     + LT + "br" + GT + value("feature_label", "Unknown") + LT + "/p" + GT;
-html += LT + "p" + GT + LT + "strong" + GT + "Feature Length:" + LT + "/strong" + GT
-    + LT + "br" + GT + value("feature_length", "Unknown") + LT + "/p" + GT;
+html += LT + "p" + GT + LT + "strong" + GT + "Feature Coordinates:" + LT + "/strong" + GT
+    + LT + "br" + GT + value("feature_coordinates", "Unknown") + LT + "/p" + GT;
 html += LT + "p" + GT + LT + "strong" + GT + "Gene Name:" + LT + "/strong" + GT
     + LT + "br" + GT + value("gene_name", "Unknown") + LT + "/p" + GT;
 html += LT + "p" + GT + LT + "strong" + GT + "Transcript Name:" + LT + "/strong" + GT

@@ -1,3 +1,10 @@
+// Guard against programmatic updates during slot-swap; the swap callback sets this flag.
+if (window.orographerSwapInProgress) { return; }
+
+// Read navigation bounds from updatable Div models so slot-swap can update them.
+var _s = parseInt(orig_start_div.text, 10);
+var _e = parseInt(orig_end_div.text, 10);
+
 const text = coord_input.value;
 const cleaned = text.replace(new RegExp("[\\s,]", "g"), "");
 const re = new RegExp(":?(\\d+)(?:-(\\d+))?$");
@@ -15,8 +22,8 @@ if (match) {
             }
             if (Math.sign(end - start) === 1) {
                 let overlapsAtAll = false;
-                if (Math.sign(orig_end - start) === 1) {
-                    if (Math.sign(end - orig_start) === 1) {
+                if (Math.sign(_e - start) === 1) {
+                    if (Math.sign(end - _s) === 1) {
                         overlapsAtAll = true;
                     }
                 }
@@ -29,28 +36,28 @@ if (match) {
                         end = Math.ceil(center + 5);
 
                         // Shift expanded region to fit within bounds when it overflows.
-                        if (Math.sign(start - orig_start) === -1) {
-                            start = orig_start;
-                            end = orig_start + 10;
-                            if (Math.sign(end - orig_end) === 1) {
-                                end = orig_end;
-                                start = orig_end - 10;
-                                if (Math.sign(start - orig_start) === -1) {
-                                    start = orig_start;
+                        if (Math.sign(start - _s) === -1) {
+                            start = _s;
+                            end = _s + 10;
+                            if (Math.sign(end - _e) === 1) {
+                                end = _e;
+                                start = _e - 10;
+                                if (Math.sign(start - _s) === -1) {
+                                    start = _s;
                                 }
                             }
-                        } else if (Math.sign(end - orig_end) === 1) {
-                            end = orig_end;
-                            start = orig_end - 10;
-                            if (Math.sign(start - orig_start) === -1) {
-                                start = orig_start;
+                        } else if (Math.sign(end - _e) === 1) {
+                            end = _e;
+                            start = _e - 10;
+                            if (Math.sign(start - _s) === -1) {
+                                start = _s;
                             }
                         }
                     }
                 }
 
-                const startInBounds = Math.sign(start - orig_start) !== -1;
-                const endInBounds = Math.sign(orig_end - end) !== -1;
+                const startInBounds = Math.sign(start - _s) !== -1;
+                const endInBounds = Math.sign(_e - end) !== -1;
                 const bothInBounds = startInBounds ? endInBounds : false;
 
                 if (bothInBounds) {

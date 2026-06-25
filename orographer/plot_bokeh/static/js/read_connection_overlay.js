@@ -473,6 +473,9 @@
         const screenX = xScale.compute(x);
         const screenY = yScale.compute(y);
         const rect = eventsEl.getBoundingClientRect();
+        if (!rect.width || !rect.height) {
+            return null;
+        }
         return {
             x: rect.left + screenX,
             y: rect.top + screenY,
@@ -692,7 +695,7 @@
         path.setAttribute("stroke-linecap", "round");
         path.setAttribute("stroke-linejoin", "round");
         path.setAttribute("stroke-width", isSelected ? "2.75" : "1.25");
-        path.setAttribute("stroke-opacity", isSelected ? "0.84" : "0.22");
+        path.setAttribute("stroke-opacity", isSelected ? "0.84" : "0.32");
         path.style.pointerEvents = "none";
 
         const hitPath = svgElement("path");
@@ -724,8 +727,10 @@
             "stroke",
             isSelected ? CONNECTOR_SELECTION_LINE_COLOR : CONNECTOR_LINE_COLOR,
         );
-        if (firstEndpoint.transition || secondEndpoint.transition) {
-            path.setAttribute("stroke-dasharray", isSelected ? "6 4" : "4 5");
+        if (isSelected) {
+            path.setAttribute("stroke-dasharray", "6 4");
+        } else if (firstEndpoint.transition || secondEndpoint.transition) {
+            path.setAttribute("stroke-dasharray", "4 5");
         }
         if (isSelected) {
             path.setAttribute("data-selected", "true");

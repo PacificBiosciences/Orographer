@@ -59,6 +59,36 @@ if (canShowModal) {
     html += LT + "p" + GT + LT + "strong" + GT + "Coordinates:" + LT + "/strong" + GT
         + LT + "br" + GT + coords + LT + "/p" + GT;
 
+    const isoformAssignments = {};
+    const assignmentsCache = window.orographerAllReadAssignments || {};
+    Object.keys(assignmentsCache).forEach(function (cacheKey) {
+        const cacheValue = assignmentsCache[cacheKey];
+        if (!cacheValue || cacheValue == "loading") return;
+        const readAssignments = cacheValue[readName];
+        if (!readAssignments) return;
+        readAssignments.forEach(function (entry) {
+            const label = entry.annotation_label || "";
+            if (!label) return;
+            if (isoformAssignments[label]) return;
+            isoformAssignments[label] = {
+                transcriptId: entry.transcript_id || "",
+                geneName: entry.gene_name || "",
+            };
+        });
+    });
+    const assignmentLabels = Object.keys(isoformAssignments);
+    if (assignmentLabels.length) {
+        html += LT + "p" + GT + LT + "strong" + GT + "Isoform Assignments:" + LT + "/strong" + GT + LT + "/p" + GT;
+        html += LT + "ul" + GT;
+        assignmentLabels.forEach(function (label) {
+            const assignment = isoformAssignments[label];
+            const transcriptText = assignment.transcriptId ? assignment.transcriptId : "Unassigned";
+            const geneText = assignment.geneName ? " (" + assignment.geneName + ")" : "";
+            html += LT + "li" + GT + LT + "strong" + GT + label + ":" + LT + "/strong" + GT + " " + transcriptText + geneText + LT + "/li" + GT;
+        });
+        html += LT + "/ul" + GT;
+    }
+
     let alignmentNumbers = [];
     let alignmentCoordinates = [];
     if (data.all_alignment_numbers) {

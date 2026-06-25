@@ -21,6 +21,7 @@ from bokeh.models import (
     Div,
     HoverTool,
     PanTool,
+    Range1d,
     Spacer,
     Span,
     TapTool,
@@ -61,12 +62,29 @@ GENE_OVERVIEW_BODY_ALPHA = 0.75
 GENE_LABEL_ALPHA = 0.9
 
 
+def enable_button_click_hold(
+    button: Button,
+    *,
+    initial_delay: int = 260,
+    repeat_delay: int = 95,
+) -> None:
+    """Tag a button for pointer-hold repeats installed by the page bootstrap script."""
+    tags = list(button.tags or [])
+    hold_tags = [
+        "orographer-click-hold",
+        f"orographer-click-hold-delay:{initial_delay}",
+        f"orographer-click-hold-repeat:{repeat_delay}",
+    ]
+    button.tags = [*tags, *[tag for tag in hold_tags if tag not in tags]]
+
+
 @dataclass(frozen=True)
 class GeneTrackRecord:
     """Collapsed gene annotation used by the scalable gene track."""
 
     gene_id: str
     gene_name: str
+    chrom: str
     start: int
     end: int
     strand: str
@@ -106,6 +124,24 @@ def _configure_genomic_x_axis(plot_figure) -> None:
 def _annotation_interval(start: int, end: int) -> tuple[int, int]:
     """Return display interval boundaries for a 1-based inclusive annotation feature."""
     return start, end + 1
+
+
+def _format_genomic_coordinates(
+    chrom: str,
+    start: int,
+    end: int,
+    *,
+    include_size: bool = False,
+) -> str:
+    """Return a compact coordinate label for annotation metadata."""
+    interval = f"{start:,}-{end:,}"
+    coordinates = interval
+    if chrom:
+        coordinates = f"{chrom}:{interval}"
+    if include_size:
+        size_bp = end - start + 1
+        return f"{coordinates} ({size_bp:,} bp)"
+    return coordinates
 
 
 def _initial_gene_track_mode(coordinate_start: int, coordinate_end: int) -> str:
@@ -199,6 +235,7 @@ def _deduplicate_gene_annotations(gene_annotations) -> list[GeneTrackRecord]:
         selection_method = str(
             getattr(gene, "representative_selection_method", "gene annotation") or "gene annotation"
         )
+        chrom = str(getattr(gene, "chrom", "") or "")
         start = int(gene.start)
         end = int(gene.end)
         exons = tuple(
@@ -214,6 +251,7 @@ def _deduplicate_gene_annotations(gene_annotations) -> list[GeneTrackRecord]:
             records_by_id[gene_id] = {
                 "gene_id": gene_id,
                 "gene_name": gene_name,
+                "chrom": chrom,
                 "start": start,
                 "end": end,
                 "strand": strand,
@@ -228,6 +266,7 @@ def _deduplicate_gene_annotations(gene_annotations) -> list[GeneTrackRecord]:
         GeneTrackRecord(
             gene_id=record["gene_id"],
             gene_name=record["gene_name"],
+            chrom=record["chrom"],
             start=record["start"],
             end=record["end"],
             strand=record["strand"],
@@ -562,33 +601,23 @@ def add_cursor_guide_callbacks(plot_figures, cursor_spans, cursor_guide_checkbox
         plot_figure.js_on_event(MouseLeave, leave_callback)
 
 
-def add_coverage_to_figure(cov_figure, coverage_tracks, haplotype_color_map=None):
-    """Render coverage depth series into *cov_figure*.
+def build_coverage_source_data(
+    coverage_tracks: dict,
+    haplotype_color_map: dict | None = None,
+) -> dict[str, dict | None]:
+    """Compute raw data dicts for coverage sources without creating Bokeh models.
 
-    coverage_tracks: dict mapping haplotype value to (x_positions, y_depths).
-    Key -1 is the total series; other keys are HP tag values.
-
-    Per-HP lines are rendered as an interactive multi_line: clicking a line
-    highlights it and shows the haplotype name label on the line. The label
-    color matches the haplotype label color in the read track above.
+    Returns {"total": dict|None, "hp": dict|None} where each dict is ready to
+    pass directly to ColumnDataSource(data=...).
     """
     if not coverage_tracks:
-        return
+        return {"total": None, "hp": None}
 
     total = coverage_tracks.get(-1)
-    total_source = None
+    total_data = None
     if total and any(y > 0 for y in total[1]):
         x_vals, y_vals = total
-        update_coverage_y_range(cov_figure, y_vals)
-        total_source = ColumnDataSource({"x": list(x_vals), "y": list(y_vals)})
-        cov_figure.varea(
-            x="x",
-            y1=0,
-            y2="y",
-            source=total_source,
-            color="#cccccc",
-            alpha=0.7,
-        )
+        total_data = {"x": list(x_vals), "y": list(y_vals)}
 
     hp_xs, hp_ys, hp_colors, hp_names = [], [], [], []
     hp_label_xs, hp_label_ys = [], []
@@ -609,13 +638,9 @@ def add_coverage_to_figure(cov_figure, coverage_tracks, haplotype_color_map=None
         hp_label_xs.append(x_vals[peak_idx])
         hp_label_ys.append(y_vals[peak_idx])
 
-    if not hp_xs:
-        if total_source is not None:
-            add_coverage_hover_to_figure(cov_figure, total_source)
-        return
-
-    source = ColumnDataSource(
-        {
+    hp_data = None
+    if hp_xs:
+        hp_data = {
             "xs": hp_xs,
             "ys": hp_ys,
             "colors": hp_colors,
@@ -623,38 +648,72 @@ def add_coverage_to_figure(cov_figure, coverage_tracks, haplotype_color_map=None
             "label_x": hp_label_xs,
             "label_y": hp_label_ys,
         }
-    )
+    return {"total": total_data, "hp": hp_data}
 
-    cov_figure.multi_line(
-        xs="xs",
-        ys="ys",
-        line_color="colors",
-        line_width=2,
-        line_alpha=0.9,
-        selection_line_width=3,
-        selection_line_alpha=1.0,
-        nonselection_line_alpha=0.15,
-        source=source,
-    )
-    cov_figure.text(
-        x="label_x",
-        y="label_y",
-        text="names",
-        source=source,
-        text_color="colors",
-        text_font_size="9pt",
-        text_font_style="bold",
-        text_align="center",
-        text_baseline="bottom",
-        text_alpha=0,
-        selection_text_alpha=1.0,
-        nonselection_text_alpha=0,
-        text_outline_color="white",
-    )
+
+def add_coverage_to_figure(
+    cov_figure, coverage_tracks, haplotype_color_map=None
+) -> dict[str, object]:
+    """Render coverage depth series into *cov_figure*.
+
+    coverage_tracks: dict mapping haplotype value to (x_positions, y_depths).
+    Key -1 is the total series; other keys are HP tag values.
+
+    Returns {"total": ColumnDataSource|None, "hp": ColumnDataSource|None}.
+    """
+    if not coverage_tracks:
+        return {"total": None, "hp": None}
+
+    cov_data = build_coverage_source_data(coverage_tracks, haplotype_color_map)
+
+    total_source = None
+    if cov_data["total"] is not None:
+        update_coverage_y_range(cov_figure, cov_data["total"]["y"])
+        total_source = ColumnDataSource(cov_data["total"])
+        cov_figure.varea(
+            x="x",
+            y1=0,
+            y2="y",
+            source=total_source,
+            color="#cccccc",
+            alpha=0.7,
+        )
+
+    hp_source = None
+    if cov_data["hp"] is not None:
+        hp_source = ColumnDataSource(cov_data["hp"])
+        cov_figure.multi_line(
+            xs="xs",
+            ys="ys",
+            line_color="colors",
+            line_width=2,
+            line_alpha=0.9,
+            selection_line_width=3,
+            selection_line_alpha=1.0,
+            nonselection_line_alpha=0.15,
+            source=hp_source,
+        )
+        cov_figure.text(
+            x="label_x",
+            y="label_y",
+            text="names",
+            source=hp_source,
+            text_color="colors",
+            text_font_size="9pt",
+            text_font_style="bold",
+            text_align="center",
+            text_baseline="bottom",
+            text_alpha=0,
+            selection_text_alpha=1.0,
+            nonselection_text_alpha=0,
+            text_outline_color="white",
+        )
+
     if total_source is not None:
-        add_coverage_hover_to_figure(cov_figure, total_source, hp_source=source)
-    if not any(isinstance(t, TapTool) for t in cov_figure.tools):
+        add_coverage_hover_to_figure(cov_figure, total_source, hp_source=hp_source)
+    if hp_source is not None and not any(isinstance(t, TapTool) for t in cov_figure.tools):
         cov_figure.add_tools(TapTool())
+    return {"total": total_source, "hp": hp_source}
 
 
 def create_gene_track_figure(main_figure, gene_track_height):
@@ -713,6 +772,74 @@ def create_genomic_x_axis_strip(shared_x_range):
     return fig
 
 
+_REPEAT_DENSITY_HEIGHT = 20
+
+
+def _build_repeat_density_source_data(
+    density: "np.ndarray",
+    region_start: int,
+    region_end: int,
+) -> dict:
+    """Return ColumnDataSource data dict for the repeat density vbar track."""
+    n = len(density)
+    span = region_end - region_start
+    bin_width = span / n
+    return {
+        "x": [region_start + (i + 0.5) * bin_width for i in range(n)],
+        "top": density.tolist(),
+        "width": [bin_width] * n,
+    }
+
+
+def create_repeat_density_figure(
+    shared_x_range,
+    density: "np.ndarray",
+    region_start: int,
+    region_end: int,
+):
+    """Thin bar-chart track showing per-bin off-diagonal repeat density.
+
+    Placed below the gene track and above the genomic x-axis strip. Each bar
+    represents one dotplot bin; height is the number of other bins that bin matched
+    in the reference self-identity dotplot.
+
+    Returns (figure, ColumnDataSource) so callers can update data on region swap.
+    """
+    y_max = float(max(density.max(), 1.0))
+    source = ColumnDataSource(_build_repeat_density_source_data(density, region_start, region_end))
+    y_range = Range1d(0, y_max * 1.1)
+    fig = figure(
+        height=_REPEAT_DENSITY_HEIGHT,
+        x_range=shared_x_range,
+        y_range=y_range,
+        toolbar_location=None,
+        tools=[],
+        sizing_mode="stretch_width",
+        outline_line_color=None,
+    )
+    fig.vbar(
+        x="x",
+        top="top",
+        width="width",
+        source=source,
+        color="#5F249F",
+        alpha=0.7,
+        line_color=None,
+    )
+    fig.xgrid.grid_line_color = None
+    fig.ygrid.grid_line_color = None
+    fig.xaxis.visible = False
+    fig.yaxis.minor_tick_line_color = None
+    fig.yaxis.major_tick_line_color = None
+    fig.yaxis.major_label_text_color = None
+    fig.yaxis.axis_line_color = None
+    fig.yaxis.axis_label = "Ident"
+    fig.yaxis.axis_label_text_font_size = "8px"
+    fig.min_border_top = 0
+    fig.min_border_bottom = 0
+    return fig, source
+
+
 def format_region_size(size_bp):
     """Format region size in a human-readable format (bp, kb, Mb, etc.)."""
     if size_bp < 1000:
@@ -741,6 +868,10 @@ def create_coordinate_display(
     enable_read_filter_checkboxes=False,
     show_checkbox_controls=True,
     model_name_suffix="",
+    original_region_widget=None,
+    nav_chrom_div=None,
+    nav_orig_start_div=None,
+    nav_orig_end_div=None,
 ):
     """Create coordinate displays: static full region at top + editable view row.
     If one_bp_renderers is provided, add a checkbox to hide/show 1bp indels.
@@ -748,6 +879,11 @@ def create_coordinate_display(
     If alignment_label_renderers is provided, add checkbox to hide alignment numbers.
     If phase_set_marker_renderers is provided, add checkbox to hide phase-set markers.
     default_hide_alignment_numbers: if True (e.g. paraphase), numbers hidden initially.
+    nav_chrom_div / nav_orig_start_div / nav_orig_end_div: when provided, view and
+    go callbacks read from these Div models instead of hardcoded values, allowing the
+    slot-swap callback to update navigation bounds after swapping regions.
+
+    Returns (coord_controls, hide_1bp_checkbox, coord_input).
     """
     start_str = f"{coordinate_start:,}"
     end_str = f"{coordinate_end:,}"
@@ -805,16 +941,21 @@ def create_coordinate_display(
             "padding-bottom": "0",
         },
     )
-    orig_start = coordinate_start
-    orig_end = coordinate_end
+    # Use caller-supplied Div models when available so swap callback can update nav bounds.
+    if nav_chrom_div is None:
+        nav_chrom_div = Div(text=chrom, visible=False)
+    if nav_orig_start_div is None:
+        nav_orig_start_div = Div(text=str(coordinate_start), visible=False)
+    if nav_orig_end_div is None:
+        nav_orig_end_div = Div(text=str(coordinate_end), visible=False)
 
     go_callback = CustomJS(
         args={
             "x_range": plot_figure.x_range,
             "coord_input": coord_input,
             "error_div": error_div,
-            "orig_start": orig_start,
-            "orig_end": orig_end,
+            "orig_start_div": nav_orig_start_div,
+            "orig_end_div": nav_orig_end_div,
         },
         code=load_javascript("coord_go_callback.js"),
     )
@@ -839,7 +980,7 @@ def create_coordinate_display(
         args={
             "coord_input": coord_input,
             "error_div": error_div,
-            "chrom": chrom,
+            "chrom_div": nav_chrom_div,
             "view_size_div": view_size_div,
         },
         code=load_javascript("view_callback.js"),
@@ -897,8 +1038,8 @@ def create_coordinate_display(
         args={
             "x_range": plot_figure.x_range,
             "factor": 0.5,
-            "orig_start": orig_start,
-            "orig_end": orig_end,
+            "orig_start_div": nav_orig_start_div,
+            "orig_end_div": nav_orig_end_div,
         },
         code=load_javascript("zoom_buttons_callback.js"),
     )
@@ -906,8 +1047,8 @@ def create_coordinate_display(
         args={
             "x_range": plot_figure.x_range,
             "factor": 2,
-            "orig_start": orig_start,
-            "orig_end": orig_end,
+            "orig_start_div": nav_orig_start_div,
+            "orig_end_div": nav_orig_end_div,
         },
         code=load_javascript("zoom_buttons_callback.js"),
     )
@@ -916,8 +1057,8 @@ def create_coordinate_display(
             "x_range": plot_figure.x_range,
             "direction": -1,
             "fraction": 0.05,
-            "orig_start": orig_start,
-            "orig_end": orig_end,
+            "orig_start_div": nav_orig_start_div,
+            "orig_end_div": nav_orig_end_div,
         },
         code=load_javascript("pan_buttons_callback.js"),
     )
@@ -926,8 +1067,8 @@ def create_coordinate_display(
             "x_range": plot_figure.x_range,
             "direction": 1,
             "fraction": 0.05,
-            "orig_start": orig_start,
-            "orig_end": orig_end,
+            "orig_start_div": nav_orig_start_div,
+            "orig_end_div": nav_orig_end_div,
         },
         code=load_javascript("pan_buttons_callback.js"),
     )
@@ -938,8 +1079,8 @@ def create_coordinate_display(
             "right_button": pan_right_btn,
             "zoom_out_button": zoom_out_btn,
             "zoom_in_button": zoom_in_btn,
-            "orig_start": orig_start,
-            "orig_end": orig_end,
+            "orig_start_div": nav_orig_start_div,
+            "orig_end_div": nav_orig_end_div,
         },
         code=load_javascript("pan_buttons_state_callback.js"),
     )
@@ -947,6 +1088,8 @@ def create_coordinate_display(
     zoom_out_btn.js_on_click(zoom_out_callback)
     pan_left_btn.js_on_click(pan_left_callback)
     pan_right_btn.js_on_click(pan_right_callback)
+    enable_button_click_hold(pan_left_btn)
+    enable_button_click_hold(pan_right_btn)
     plot_figure.x_range.js_on_change("start", pan_state_callback)
     plot_figure.x_range.js_on_change("end", pan_state_callback)
     plot_figure.x_range.js_on_change("change", pan_state_callback)
@@ -996,7 +1139,7 @@ def create_coordinate_display(
         view_size_with_zoom,
         read_search_button if read_search_button is not None else Spacer(width=0, height=1),
         Spacer(sizing_mode="stretch_width"),
-        original_region_block_wide,
+        original_region_widget if original_region_widget is not None else original_region_block_wide,
         sizing_mode="stretch_width",
         align="start",
         spacing=8,
@@ -1020,6 +1163,7 @@ def create_coordinate_display(
     return (
         coord_controls,
         hide_1bp_checkbox,
+        coord_input,
     )
 
 
@@ -1215,20 +1359,22 @@ def create_global_checkbox_controls(
     return controls, hide_1bp_checkbox, cursor_guide_checkbox
 
 
-def add_separator_lines(
-    plot_figure,
-    read_names,
-    read_to_y_bottom,
-    read_heights,
-    coordinate_start,
-    coordinate_end,
+def _build_separator_raw_data(
+    read_names: list,
+    read_to_y_bottom: dict,
+    read_heights: dict,
+    coordinate_start: int,
+    coordinate_end: int,
     layout_modes=None,
     read_filter_flags_by_read=None,
-):
-    """Add horizontal dotted lines to separate reads (single multi_line glyph)."""
+) -> dict:
+    """Compute separator-line source data without creating Bokeh models.
+
+    Used by add_separator_lines (rendering) and _serialize_region_for_swap (serialization).
+    """
+    read_filter_flags_by_read = read_filter_flags_by_read or {}
     xs = [[coordinate_start, coordinate_end]]
     ys = [[0, 0]]
-    read_filter_flags_by_read = read_filter_flags_by_read or {}
     source_read_names = [""]
     has_split_alignment = [True]
     has_multiregion_connection = [True]
@@ -1262,6 +1408,29 @@ def add_separator_lines(
                     mode_ys.append([0, 0])
             source_data[_layout_mode_column("ys", mode)] = mode_ys
     add_read_filter_visibility_columns(source_data)
+    return source_data
+
+
+def add_separator_lines(
+    plot_figure,
+    read_names,
+    read_to_y_bottom,
+    read_heights,
+    coordinate_start,
+    coordinate_end,
+    layout_modes=None,
+    read_filter_flags_by_read=None,
+):
+    """Add horizontal dotted lines to separate reads (single multi_line glyph)."""
+    source_data = _build_separator_raw_data(
+        read_names,
+        read_to_y_bottom,
+        read_heights,
+        coordinate_start,
+        coordinate_end,
+        layout_modes,
+        read_filter_flags_by_read,
+    )
     source = ColumnDataSource(source_data)
     plot_figure.multi_line(
         xs="xs",
@@ -1283,20 +1452,18 @@ def get_haplotype_label(haplotype):
     return f"{haplotype}"
 
 
-def add_haplotype_labels(
-    plot_figure,
+def _build_hp_label_raw_data(
     group_boundaries,
     haplotype_order,
     coordinate_start,
     coordinate_end,
     haplotype_color_fn=None,
     layout_modes=None,
-):
-    """Add text labels and separator lines for each haplotype group.
+) -> tuple[dict | None, dict | None]:
+    """Compute HP label source data dicts without creating Bokeh models.
 
-    haplotype_color_fn: optional callable(hp_int) -> color_str. When provided
-    the label text is colored to match the per-HP coverage line, creating a
-    direct visual link between the read-track label and the coverage track.
+    Returns (separator_data, label_data) where each is a populated dict or None when empty.
+    Used by add_haplotype_labels (rendering) and _serialize_region_for_swap (serialization).
     """
     label_x = []
     label_y = []
@@ -1306,7 +1473,6 @@ def add_haplotype_labels(
     separator_xs = []
     separator_ys = []
     separator_haplotype_pairs = []
-    sources = []
     label_x_pos = coordinate_start + (coordinate_end - coordinate_start) * 0.01
 
     for i, haplotype in enumerate(haplotype_order):
@@ -1337,8 +1503,9 @@ def add_haplotype_labels(
                 separator_ys.append([separator_y, separator_y])
                 separator_haplotype_pairs.append((haplotype, next_haplotype))
 
+    separator_data = None
     if separator_xs:
-        separator_source_data = {
+        separator_data = {
             "xs": separator_xs,
             "ys": separator_ys,
             "read_layout_mode": ["all"] * len(separator_xs),
@@ -1355,23 +1522,14 @@ def add_haplotype_labels(
                     else:
                         separator_y = separator_ys[row_index][0]
                     mode_ys.append([separator_y, separator_y])
-                separator_source_data[_layout_mode_column("ys", mode)] = mode_ys
-        add_read_filter_visibility_columns(separator_source_data)
-        separator_source = ColumnDataSource(separator_source_data)
-        sources.append(separator_source)
-        plot_figure.multi_line(
-            xs="xs",
-            ys="ys",
-            source=separator_source,
-            line_color=PLOT_CONFIG["sample_label_color"],
-            line_width=1.0,
-            line_alpha=1,
-            level="underlay",
-        )
+                separator_data[_layout_mode_column("ys", mode)] = mode_ys
+        add_read_filter_visibility_columns(separator_data)
+
+    label_data = None
     if label_x:
         swatch_offset = (coordinate_end - coordinate_start) * 0.006
         text_x = [x + swatch_offset for x in label_x]
-        label_source_data = {
+        label_data = {
             "x": label_x,
             "y": label_y,
             "text_x": text_x,
@@ -1389,10 +1547,49 @@ def add_haplotype_labels(
                         mode_y.append((y_start + y_end) / 2)
                     else:
                         mode_y.append(label_y[row_index])
-                label_source_data[_layout_mode_column("y", mode)] = mode_y
-        add_read_filter_visibility_columns(label_source_data)
-        label_source = ColumnDataSource(data=label_source_data)
-        sources.append(label_source)
+                label_data[_layout_mode_column("y", mode)] = mode_y
+        add_read_filter_visibility_columns(label_data)
+
+    return separator_data, label_data
+
+
+def add_haplotype_labels(
+    plot_figure,
+    group_boundaries,
+    haplotype_order,
+    coordinate_start,
+    coordinate_end,
+    haplotype_color_fn=None,
+    layout_modes=None,
+) -> dict:
+    """Add text labels and separator lines for each haplotype group.
+
+    haplotype_color_fn: optional callable(hp_int) -> color_str. When provided
+    the label text is colored to match the per-HP coverage line, creating a
+    direct visual link between the read-track label and the coverage track.
+
+    Returns a dict {"separator": ColumnDataSource|None, "label": ColumnDataSource|None}.
+    """
+    separator_data, label_data = _build_hp_label_raw_data(
+        group_boundaries, haplotype_order, coordinate_start, coordinate_end,
+        haplotype_color_fn, layout_modes,
+    )
+    separator_source = None
+    label_source = None
+
+    if separator_data is not None:
+        separator_source = ColumnDataSource(separator_data)
+        plot_figure.multi_line(
+            xs="xs",
+            ys="ys",
+            source=separator_source,
+            line_color=PLOT_CONFIG["sample_label_color"],
+            line_width=1.0,
+            line_alpha=1,
+            level="underlay",
+        )
+    if label_data is not None:
+        label_source = ColumnDataSource(data=label_data)
         plot_figure.scatter(
             x="x",
             y="y",
@@ -1415,19 +1612,20 @@ def add_haplotype_labels(
             text_baseline="middle",
             text_alpha=1.0,
         )
-    return sources
+    return {"separator": separator_source, "label": label_source}
 
 
-def add_gene_track(
-    plot_figure, gene_annotations, gene_track_y_start, coordinate_start, coordinate_end
-):
-    """Add a zoom-adaptive gene annotation track. Returns height of the gene track."""
-    if not gene_annotations:
-        return 0
+def _build_gene_track_raw_data(
+    gene_annotations, gene_track_y_start, coordinate_start, coordinate_end, plot_width_px=None
+) -> tuple[float, dict, dict, dict, dict, dict]:
+    """Compute gene track data dicts without creating Bokeh models.
 
-    gene_color = "#3366CC"
+    Returns (height, body_data, exon_data, intron_data, arrow_data, label_data).
+    Used by add_gene_track (rendering) and _serialize_region_for_swap (serialization).
+    """
+    if plot_width_px is None:
+        plot_width_px = GENE_TRACK_PLOT_WIDTH_PX
     mode = _initial_gene_track_mode(coordinate_start, coordinate_end)
-    plot_width_px = int(getattr(plot_figure, "width", GENE_TRACK_PLOT_WIDTH_PX))
     genes = _deduplicate_gene_annotations(gene_annotations)
     gene_row_assignments, num_rows = _assign_gene_rows(
         genes,
@@ -1459,6 +1657,8 @@ def add_gene_track(
         "gene_name": [],
         "gene_strand": [],
         "exon_number": [],
+        "exon_coordinates": [],
+        "isoform_coordinates": [],
         "representative_transcript": [],
         "representative_selection_method": [],
         "fill_alpha": [],
@@ -1521,7 +1721,9 @@ def add_gene_track(
             body_data["gene_id"].append(gene.gene_id)
             body_data["gene_name"].append(gene.gene_name)
             body_data["strand"].append(gene.strand or "unknown")
-            body_data["coordinates"].append(f"{gene.start:,}-{gene.end:,}")
+            body_data["coordinates"].append(
+                _format_genomic_coordinates(gene.chrom, gene.start, gene.end)
+            )
             body_data["line_alpha"].append(body_alpha[0])
             body_data["line_alpha_overview"].append(body_alpha[1])
             body_data["line_alpha_medium"].append(body_alpha[2])
@@ -1555,6 +1757,22 @@ def add_gene_track(
                 else:
                     exon_data["gene_strand"].append(_gene_strand_modal_label(strand_token))
                 exon_data["exon_number"].append(str(exon_number))
+                exon_data["exon_coordinates"].append(
+                    _format_genomic_coordinates(
+                        gene.chrom,
+                        exon_start,
+                        exon_end,
+                        include_size=True,
+                    )
+                )
+                exon_data["isoform_coordinates"].append(
+                    _format_genomic_coordinates(
+                        gene.chrom,
+                        gene.start,
+                        gene.end,
+                        include_size=True,
+                    )
+                )
                 transcript_label = gene.representative_transcript_name or ""
                 if gene.representative_transcript_id:
                     transcript_label = gene.representative_transcript_id
@@ -1647,7 +1865,33 @@ def add_gene_track(
             label_data["text_alpha_medium"].append(label_alpha[2])
             label_data["text_alpha_detail"].append(label_alpha[3])
 
+    return num_rows * row_height + 1.0, body_data, exon_data, intron_data, arrow_data, label_data
+
+
+def add_gene_track(
+    plot_figure, gene_annotations, gene_track_y_start, coordinate_start, coordinate_end
+) -> tuple[float, dict]:
+    """Add a zoom-adaptive gene annotation track.
+
+    Returns (height, sources) where sources maps "body"/"exon"/"intron"/"arrow"/"label"
+    to their ColumnDataSource (or None when the data set was empty).
+    """
+    if not gene_annotations:
+        return 0, {}
+
+    gene_color = "#3366CC"
+    plot_width_px = int(getattr(plot_figure, "width", GENE_TRACK_PLOT_WIDTH_PX))
+    height, body_data, exon_data, intron_data, arrow_data, label_data = _build_gene_track_raw_data(
+        gene_annotations, gene_track_y_start, coordinate_start, coordinate_end, plot_width_px
+    )
+
     callback_sources = []
+    body_source = None
+    intron_source = None
+    exon_source = None
+    arrow_source = None
+    label_source = None
+
     if body_data["x0"]:
         body_source = ColumnDataSource(data=body_data)
         body_renderer = plot_figure.segment(
@@ -1742,7 +1986,14 @@ def add_gene_track(
 
     if callback_sources:
         _add_gene_track_zoom_callback(plot_figure, callback_sources)
-    return num_rows * row_height + 1.0
+    gene_sources = {
+        "body": body_source,
+        "intron": intron_source,
+        "exon": exon_source,
+        "arrow": arrow_source,
+        "label": label_source,
+    }
+    return height, gene_sources
 
 
 def _cluster_insertion_sites(sites: list[dict], cluster_bp: float) -> list[list[dict]]:
@@ -1950,8 +2201,49 @@ def add_insertion_markers_to_figure(
 
 _DOTPLOT_CMAP = LinearSegmentedColormap.from_list(
     "orographer_dotplot",
-    ["#ffffff", "#1f4e79"],
-)
+    ["#ffffff", "#000000"],
+).with_extremes(under="#d8d8d8")  # N-masked bins (sentinel -1.0) render as light gray
+
+
+def _nice_tick_interval(span: int, target_count: int = 4) -> int:
+    """Return a round tick interval that produces approximately target_count ticks."""
+    if span <= 0:
+        return 1
+    raw = span / target_count
+    magnitude = 10 ** math.floor(math.log10(max(raw, 1)))
+    candidates = [1, 2, 5, 10]
+    interval = min(candidates, key=lambda m: abs(m * magnitude - raw)) * magnitude
+    return max(1, int(interval))
+
+
+def _format_genomic_pos(pos: int) -> str:
+    """Return a human-readable genomic position string."""
+    if pos >= 1_000_000:
+        return f"{pos / 1_000_000:.2f} Mb"
+    if pos >= 1_000:
+        return f"{pos / 1_000:.1f} kb"
+    return f"{pos} bp"
+
+
+def _build_block_ticks(blocks: list[dict]) -> tuple[list[float], list[str]]:
+    """Return tick positions (in offset space) and labels for a multi-block dotplot."""
+    positions: list[float] = []
+    labels: list[str] = []
+    for block in blocks:
+        offset_span = block["offset_end"] - block["offset_start"]
+        if offset_span <= 0:
+            continue
+        interval = _nice_tick_interval(offset_span)
+        tick_genomic = math.ceil(block["start"] / interval) * interval
+        while True:
+            offset_pos = block["offset_start"] + (tick_genomic - block["start"])
+            if offset_pos >= block["offset_end"]:
+                break
+            if offset_pos >= block["offset_start"]:
+                positions.append(float(offset_pos))
+                labels.append(f"{block['chromosome']}:{_format_genomic_pos(tick_genomic)}")
+            tick_genomic += interval
+    return positions, labels
 
 
 def _render_dotplot_png_data_url(
@@ -1983,8 +2275,15 @@ def _render_dotplot_png_data_url(
     )
     if blocks:
         boundary_color = "#d36b9f"
+        resolution = matrix.shape[0]
+        total_len = blocks[-1]["offset_end"]
         for block in blocks[:-1]:
-            boundary = block["offset_end"]
+            # Align with the left edge of the first bin belonging to the next region.
+            # The bin straddling the junction is occupied by the next region's k-mers
+            # (not N-masked), so the grey area ends at this bin's left edge, not at
+            # the exact sequence offset.
+            first_next_bin = block["offset_end"] * resolution // total_len
+            boundary = first_next_bin * total_len / resolution
             axis.axvline(boundary, color=boundary_color, linewidth=0.8, alpha=0.8)
             axis.axhline(boundary, color=boundary_color, linewidth=0.8, alpha=0.8)
     if not with_axes:
@@ -1996,19 +2295,18 @@ def _render_dotplot_png_data_url(
         return f"data:image/png;base64,{encoded}"
 
     if blocks:
-        centers = [(block["offset_start"] + block["offset_end"]) / 2 for block in blocks]
-        labels = [block["label"] for block in blocks]
-        axis.set_xticks(centers)
-        axis.set_yticks(centers)
-        axis.set_xticklabels(labels)
-        axis.set_yticklabels(labels)
+        tick_positions, tick_labels = _build_block_ticks(blocks)
+        axis.set_xticks(tick_positions)
+        axis.set_yticks(tick_positions)
+        axis.set_xticklabels(tick_labels, fontsize=7)
+        axis.set_yticklabels(tick_labels, fontsize=7)
         axis.tick_params(axis="x", labelrotation=45)
     else:
         axis.set_xlabel("Reference position")
         axis.set_ylabel("Reference position")
-        kb_formatter = FuncFormatter(lambda value, _pos: f"{value / 1000:,.0f} kb")
-        axis.xaxis.set_major_formatter(kb_formatter)
-        axis.yaxis.set_major_formatter(kb_formatter)
+        pos_formatter = FuncFormatter(lambda v, _p: _format_genomic_pos(int(v)))
+        axis.xaxis.set_major_formatter(pos_formatter)
+        axis.yaxis.set_major_formatter(pos_formatter)
         axis.tick_params(axis="x", labelrotation=45)
     axis.grid(False)
     fig.tight_layout()
@@ -2027,6 +2325,7 @@ def create_dotplot_thumbnail(
     blocks: list[dict] | None = None,
     region_label: str | None = None,
     modal_title: str = "Reference self-identity dotplot",
+    individual_payloads: list[dict] | None = None,
 ):
     """Create a compact clickable dotplot thumbnail for the coordinate toolbar."""
     thumbnail_url = _render_dotplot_png_data_url(
@@ -2045,6 +2344,27 @@ def create_dotplot_thumbnail(
         dpi=120,
         blocks=blocks,
     )
+    individual_images: list[dict] = []
+    for ind in individual_payloads or []:
+        ind_url = _render_dotplot_png_data_url(
+            ind["matrix"],
+            ind["region"],
+            with_axes=True,
+            figure_size=(6.4, 6.4),
+            dpi=120,
+            blocks=None,
+        )
+        ind_region = ind["region"]
+        ind_span = ind_region.end - ind_region.start + 1
+        ind_bin_size = round(ind_span / 512)
+        individual_images.append(
+            {
+                "url": ind_url,
+                "label": ind["label"],
+                "title": ind["title"],
+                "bin_size_bp": ind_bin_size,
+            }
+        )
     thumbnail_background = (
         f"url({thumbnail_url}), linear-gradient(#ffffff, #ffffff), "
         "linear-gradient(#6b7280, #6b7280)"
@@ -2088,6 +2408,11 @@ def create_dotplot_thumbnail(
             """,
         ],
     )
+    if blocks:
+        total_span = blocks[-1]["offset_end"]
+    else:
+        total_span = region.end - region.start + 1
+    bin_size_bp = round(total_span / 512)
     dot_button.js_on_click(
         CustomJS(
             args={
@@ -2096,6 +2421,8 @@ def create_dotplot_thumbnail(
                 or region.coordinate_str
                 or f"{region.chromosome}:{region.start:,}-{region.end:,}",
                 "title_text": modal_title,
+                "individual_images": individual_images,
+                "bin_size_bp": bin_size_bp,
             },
             code=load_javascript("dotplot_modal_callback.js"),
         ),

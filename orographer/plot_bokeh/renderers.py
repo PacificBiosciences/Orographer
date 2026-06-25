@@ -50,6 +50,10 @@ def add_arrows_to_plot(
     arrow_data.setdefault("read_filter_alpha", [1.0] * row_count)
     arrow_data.setdefault("has_split_alignment", [False] * row_count)
     arrow_data.setdefault("has_multiregion_connection", [False] * row_count)
+    arrow_data.setdefault(
+        "chevron_tip_fraction",
+        [PLOT_CONFIG["read_chevron_tip_fraction"]] * row_count,
+    )
     arrow_data.setdefault("arrow_line_alpha", [PLOT_CONFIG["arrow_line_alpha"]] * row_count)
     arrow_data.setdefault("arrowhead_alpha", [PLOT_CONFIG["arrowhead_fill_alpha"]] * row_count)
     arrow_data.setdefault("arrow_selected_alpha", [1.0] * row_count)
@@ -236,6 +240,75 @@ def _add_deletion_markers(plot_figure: Any, deletion_data: dict, renderers: dict
         if is_one_bp:
             renderers["one_bp"].append(segment)
             renderers["one_bp_segments"].append(segment)
+
+
+def _build_variant_sources_data_list(variant_data: dict) -> list[dict]:
+    """Return a list of source dicts parallel to the sources added by add_variants_to_plot.
+
+    Used by _serialize_region_for_swap to produce variant source data for non-built regions.
+    Order matches how add_variants_to_plot appends to renderers["sources"].
+    """
+    result: list[dict] = []
+    mismatch_data = dict(variant_data.get("mismatch", {}))
+    if mismatch_data.get("x"):
+        row_count = len(mismatch_data["x"])
+        result.append(
+            _variant_defaults(
+                mismatch_data,
+                row_count,
+                {
+                    "marker_fill_alpha": PLOT_CONFIG["mismatch_fill_alpha"],
+                    "marker_line_alpha": PLOT_CONFIG["mismatch_line_alpha"],
+                    "text_alpha": 1.0,
+                },
+            )
+        )
+    insertion_data = dict(variant_data.get("insertion", {}))
+    if insertion_data.get("x"):
+        row_count = len(insertion_data["x"])
+        ins_with_defaults = _variant_defaults(
+            insertion_data,
+            row_count,
+            {
+                "marker_fill_alpha": PLOT_CONFIG["insertion_fill_alpha"],
+                "marker_line_alpha": PLOT_CONFIG["insertion_line_alpha"],
+                "text_alpha": 1.0,
+            },
+        )
+        idx_1bp = [idx for idx, flag in enumerate(ins_with_defaults["is_1bp"]) if flag]
+        idx_other = [idx for idx, flag in enumerate(ins_with_defaults["is_1bp"]) if not flag]
+        for idx_list in (idx_1bp, idx_other):
+            if idx_list:
+                sub = {k: [v[i] for i in idx_list] for k, v in ins_with_defaults.items()}
+                sub.pop("is_1bp", None)
+                sub["text"] = [f"{count}I" for count in sub["count"]]
+                result.append(sub)
+    deletion_data = dict(variant_data.get("deletion", {}))
+    if deletion_data.get("x0"):
+        row_count = len(deletion_data["x0"])
+        del_with_defaults = _variant_defaults(
+            deletion_data,
+            row_count,
+            {"line_alpha": PLOT_CONFIG["deletion_line_alpha"]},
+        )
+        idx_1bp = [idx for idx, flag in enumerate(del_with_defaults["is_1bp"]) if flag]
+        idx_other = [idx for idx, flag in enumerate(del_with_defaults["is_1bp"]) if not flag]
+        kept_keys = (
+            "x0", "x1", "y", "line_alpha", "read_filter_alpha",
+            "has_split_alignment", "has_multiregion_connection", "read_name", "layout_read_name",
+        )
+        for idx_list in (idx_1bp, idx_other):
+            if idx_list:
+                sub = {
+                    k: [del_with_defaults[k][i] for i in idx_list]
+                    for k in kept_keys
+                    if k in del_with_defaults
+                }
+                for key, value in del_with_defaults.items():
+                    if key.startswith("y_"):
+                        sub[key] = [value[i] for i in idx_list]
+                result.append(sub)
+    return result
 
 
 def add_variants_to_plot(plot_figure: Any, variant_data: dict) -> dict:

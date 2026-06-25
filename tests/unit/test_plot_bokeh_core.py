@@ -7,13 +7,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from bokeh.models import ColumnDataSource, CustomJS, Div, HoverTool, Range1d, TapTool
+from bokeh.models import ColumnDataSource, CustomJS, Div, GlyphRenderer, HoverTool, Range1d, TapTool
 from bokeh.plotting import figure
 
 from orographer.plot_bokeh import plot_bokeh
 from orographer.plot_bokeh.callbacks import compact_bokeh_json, expand_compact_bokeh_json
+from orographer.plot_bokeh.segment_processing import chevron_tip_fraction
 from orographer.utils import (
     COMPLEX_SV_REGION_TYPE,
+    ISOSEQ_REGION_TYPE,
     PARAPHASE_REGION_TYPE,
     OutputConfig,
     Region,
@@ -187,6 +189,58 @@ def test_isoseq_lazy_chunks_write_static_read_page_json(tmp_path: Path) -> None:
     assert max(total_coverage_data["y"]) == 2
 
 
+def test_isoseq_lazy_chunks_accept_custom_read_page_size(tmp_path: Path) -> None:
+    groups = [
+        {
+            "group_id": "T1",
+            "read_names": ["readA"],
+            "assigned_read_count": 1,
+        }
+    ]
+    segments_by_read = {
+        "readA": [
+            segment(
+                pos=100,
+                end=200,
+                readname="readA",
+                fwd_read_start=0,
+                fwd_read_end=100,
+            )
+        ],
+    }
+    layout = {
+        "read_metadata": {
+            "readA": {
+                "gene_id": "G1",
+                "gene_name": "Gene1",
+                "transcript_id": "T1",
+                "group_id": "T1",
+            },
+        },
+        "selected_read_y_start": 1.0,
+    }
+
+    plot_bokeh._prepare_isoseq_lazy_chunks(
+        groups,
+        segments_by_read,
+        layout,
+        90,
+        210,
+        0,
+        0,
+        "sample1",
+        "plot-class",
+        "plot-id",
+        chunk_dir=str(tmp_path),
+        chunk_url_prefix="chunks",
+        read_page_size=50,
+    )
+
+    with gzip.open(tmp_path / "r0_row0_reads_manifest.json.gz", "rt", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    assert manifest["page_size"] == 50
+
+
 def test_isoseq_coverage_uses_aligned_blocks_not_introns() -> None:
     segments_by_read = {
         "readA": [
@@ -278,6 +332,60 @@ def test_isoseq_exon_labels_use_local_display_rank() -> None:
     assert feature_label_source.data["x"] == pytest.approx([150.5])
 
 
+def test_isoseq_single_exon_transcript_gets_direction_marker() -> None:
+    transcript = SimpleNamespace(
+        transcript_id="T1",
+        transcript_name="Tx1",
+        gene_id="G1",
+        gene_name="Gene1",
+        chrom="chr1",
+        start=100,
+        end=200,
+        strand="-",
+        exons=[(100, 200, 1)],
+    )
+    groups = [
+        {
+            "group_id": "T1",
+            "transcript": transcript,
+            "read_names": [],
+            "assigned_read_count": 0,
+            "gene_transcript_count": 1,
+            "is_unassigned": False,
+        }
+    ]
+    layout = plot_bokeh._build_isoseq_layout(groups, {})
+    plot_figure = figure(x_range=(150, 250), y_range=(1, 0))
+    tap_tool = TapTool()
+    plot_figure.add_tools(tap_tool)
+
+    result = plot_bokeh.add_isoseq_transcripts_to_plot(
+        plot_figure,
+        tap_tool,
+        groups,
+        layout,
+        150,
+        250,
+    )
+
+    intron_source = result[2]
+    intron_arrow_source = result[3]
+    assert intron_source is None
+    assert intron_arrow_source is not None
+    assert intron_arrow_source.data["x"] == pytest.approx([175.5])
+    assert intron_arrow_source.data["angle"] == [math.pi / 2]
+    assert intron_arrow_source.data["fill_color"] == ["#FFFFFF"]
+    assert intron_arrow_source.data["transcript_id"] == ["T1"]
+    arrow_renderers = [
+        renderer
+        for renderer in plot_figure.renderers
+        if isinstance(renderer, GlyphRenderer)
+        and renderer.data_source is intron_arrow_source
+    ]
+    assert arrow_renderers
+    assert arrow_renderers[0].level == "overlay"
+
+
 def test_isoseq_reverse_strand_exon_labels_use_transcript_order() -> None:
     transcript = SimpleNamespace(
         transcript_id="T1",
@@ -365,6 +473,30 @@ def test_isoseq_controls_place_dotplot_after_gene_filter() -> None:
     assert controls.children[3].label == "Hide unselected isoforms"
 
 
+def test_isoseq_controls_include_hide_comparison_when_comparison_sources_exist() -> None:
+    transcript_source = ColumnDataSource(
+        {
+            "transcript_id": ["T1"],
+            "transcript_name": ["Tx1"],
+            "source_kind": ["transcript"],
+            "gene_id": ["G1"],
+            "gene_name": ["Gene1"],
+            "annotation_id": ["comparison"],
+            "annotation_label": ["Comparison GTF"],
+        }
+    )
+    comparison_div = Div(text="Comparison GTF")
+
+    controls = plot_bokeh.create_isoseq_controls(
+        [transcript_source],
+        [],
+        comparison_components=[comparison_div],
+    )
+
+    assert controls is not None
+    assert controls.children[-1].label == "Hide comparison GTF"
+
+
 def test_format_alignment_coordinates_includes_exact_comma_formatted_span() -> None:
     assert (
         plot_bokeh.format_alignment_coordinates("chr1", 174_937_531, 174_938_005)
@@ -402,7 +534,7 @@ def test_process_segments_clips_arrows_and_extracts_variants() -> None:
                 end=210,
                 mismatches=[(119, "T")],
                 insertions=[(129, "A"), (139, "A" * 10)],
-                deletions=[(149, 151)],
+                deletions=[(179, 181)],
                 inclusion_reason="10 bp INS at chr1:130",
             )
         ],
@@ -426,6 +558,10 @@ def test_process_segments_clips_arrows_and_extracts_variants() -> None:
     assert arrow_data["x1"] == [200, 150]
     assert arrow_data["read_name"] == ["readA", "readB"]
     assert arrow_data["source_kind"] == ["arrow", "arrow"]
+    assert arrow_data["chevron_tip_fraction"] == [
+        0.65,
+        plot_bokeh.PLOT_CONFIG["read_chevron_tip_fraction"],
+    ]
     assert clickable_data["customdata"][0]["sample_label"] == "sample"
     assert clickable_data["customdata"][0]["inclusion_reason"] == "10 bp INS at chr1:130"
     assert clickable_data["customdata"][1]["inclusion_reason"] == ""
@@ -433,11 +569,21 @@ def test_process_segments_clips_arrows_and_extracts_variants() -> None:
     assert variant_data["mismatch"]["x"] == [120]
     assert variant_data["insertion"]["x"] == [130, 140]
     assert variant_data["insertion"]["is_1bp"] == [True, False]
-    assert variant_data["deletion"]["x0"] == [150]
-    assert variant_data["deletion"]["x1"] == [150]
+    assert variant_data["deletion"]["x0"] == [180]
+    assert variant_data["deletion"]["x1"] == [180]
     assert variant_data["deletion"]["is_1bp"] == [False]
     assert connector_data["stub_x0"] == []
     assert same_region_data["xs"] == []
+
+
+def test_chevron_tip_fraction_avoids_deletion_under_glyph_back_edge() -> None:
+    assert chevron_tip_fraction(
+        100,
+        200,
+        [(166, 167)],
+        100,
+        10000,
+    ) == 0.65
 
 
 def test_process_segments_numbers_isoseq_blocks_by_read_orientation() -> None:
@@ -1268,6 +1414,26 @@ def test_add_arrows_to_plot_returns_source_with_interior_chevrons() -> None:
     assert fig.renderers[-1].glyph.ys == "chevron_ys"
 
 
+def test_add_arrows_to_plot_uses_per_row_chevron_tip_fraction() -> None:
+    fig = figure()
+    source, _renderer = plot_bokeh.add_arrows_to_plot(
+        fig,
+        {
+            "x0": [100, 200],
+            "x1": [200, 100],
+            "y": [1, 2],
+            "color": ["red", "blue"],
+            "read_name": ["fwd", "rev"],
+            "chevron_tip_fraction": [0.65, 0.65],
+        },
+    )
+
+    assert source.data["chevron_xs"][0] == pytest.approx([157, 165, 157])
+    assert source.data["chevron_ys"][0] == pytest.approx([1.035, 1, 0.965])
+    assert source.data["chevron_xs"][1] == pytest.approx([143, 135, 143])
+    assert source.data["chevron_ys"][1] == pytest.approx([2.035, 2, 1.965])
+
+
 def test_add_variants_to_plot_splits_one_bp_renderers() -> None:
     fig = figure()
     renderers = plot_bokeh.add_variants_to_plot(
@@ -1565,3 +1731,109 @@ def test_plot_reads_bokeh_saves_no_data_layout(monkeypatch: pytest.MonkeyPatch, 
     assert output == str(tmp_path / "sample_chr1_100_200_bokeh.html")
     assert captured["output_file"] == output
     assert captured["prefix"] == "sample"
+
+
+def test_plot_reads_bokeh_preserves_isoseq_track_height_for_dual_gtf(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict = {}
+    region = Region("chr1", 100, 250, "chr1:100-250")
+
+    def save_plot(layout, output_file: str, prefix: str | None) -> None:
+        captured["layout"] = layout
+        captured["output_file"] = output_file
+        captured["prefix"] = prefix
+
+    original_prepare_chunks = plot_bokeh.isoseq_tracks.prepare_lazy_chunks
+    read_page_sizes = []
+
+    def prepare_chunks_with_capture(*args, **kwargs):
+        read_page_sizes.append(kwargs.get("read_page_size"))
+        return original_prepare_chunks(*args, **kwargs)
+
+    def group(transcript_id: str, annotation_id: str, annotation_label: str) -> dict:
+        transcript = SimpleNamespace(
+            transcript_id=transcript_id,
+            transcript_name=transcript_id,
+            gene_id="G1",
+            gene_name="Gene1",
+            chrom="chr1",
+            start=100,
+            end=200,
+            strand="+",
+            exons=[(100, 200, 1)],
+        )
+        return {
+            "group_id": transcript_id,
+            "transcript": transcript,
+            "read_names": [],
+            "assigned_read_count": 0,
+            "gene_transcript_count": 1,
+            "is_unassigned": False,
+            "annotation_id": annotation_id,
+            "annotation_label": annotation_label,
+        }
+
+    monkeypatch.setattr(plot_bokeh, "save_plot_with_modal", save_plot)
+    monkeypatch.setattr(
+        plot_bokeh.isoseq_tracks,
+        "prepare_lazy_chunks",
+        prepare_chunks_with_capture,
+    )
+
+    output = plot_bokeh.plot_reads_bokeh(
+        [
+            {
+                "region": region,
+                "gene_annotations": [],
+                "isoseq": True,
+                "bam_rows": [
+                    {
+                        "segments_by_read": {},
+                        "region_type": ISOSEQ_REGION_TYPE,
+                        "reference_path": None,
+                        "vcf_variants": [],
+                        "sample_label": "sample",
+                        "isoseq_groups": [group("TX1", "primary", "Primary GTF")],
+                        "isoseq_annotation_tracks": [
+                            {
+                                "annotation_id": "primary",
+                                "annotation_label": "Primary GTF",
+                                "isoseq_groups": [group("TX1", "primary", "Primary GTF")],
+                            },
+                            {
+                                "annotation_id": "comparison",
+                                "annotation_label": "Comparison GTF",
+                                "isoseq_groups": [
+                                    group("TX2", "comparison", "Comparison GTF")
+                                ],
+                            },
+                        ],
+                    }
+                ],
+            }
+        ],
+        OutputConfig(str(tmp_path), "sample"),
+    )
+
+    final_layout = captured["layout"]
+    region_row = final_layout.children[1]
+
+    assert output == str(tmp_path / "sample_chr1_100_250_bokeh.html")
+    assert final_layout.sizing_mode == "stretch_both"
+    assert region_row.sizing_mode == "stretch_both"
+    assert region_row.children[0].sizing_mode == "stretch_both"
+    isoseq_figures = []
+    components = [final_layout]
+    while components:
+        component = components.pop()
+        css_classes = getattr(component, "css_classes", [])
+        if any(css_class.startswith("orographer-isoseq-plot") for css_class in css_classes):
+            isoseq_figures.append(component)
+        components.extend(getattr(component, "children", []))
+
+    assert len(isoseq_figures) == 2
+    assert [figure.height for figure in isoseq_figures] == [480, 480]
+    assert [figure.sizing_mode for figure in isoseq_figures] == ["stretch_both", "stretch_both"]
+    assert read_page_sizes == [50, 50]

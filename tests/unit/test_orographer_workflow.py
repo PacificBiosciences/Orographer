@@ -44,7 +44,8 @@ def test_attach_dotplot_images_adds_combined_payload_when_reference_sequence_is_
 
     payload = region_data[0]["dotplot_payload"]
     assert payload["matrix"] is expected
-    assert payload["total_span"] == 52
+    # total_span uses actual sequence lengths (4+4=8), not nominal region spans (21+31=52).
+    assert payload["total_span"] == 8
     assert captured_sequence == "AAAACCCC"
     assert fetched_regions == [first_region, second_region]
     assert region_data[1]["dotplot_payload"] is None
@@ -56,7 +57,7 @@ def test_attach_dotplot_images_adds_combined_payload_when_reference_sequence_is_
             "start": 100,
             "end": 120,
             "offset_start": 0,
-            "offset_end": 21,
+            "offset_end": 4,   # actual sequence length, not nominal span 21
             "span": 21,
             "sequence_length": 4,
         },
@@ -66,12 +67,153 @@ def test_attach_dotplot_images_adds_combined_payload_when_reference_sequence_is_
             "chromosome": "chr2",
             "start": 200,
             "end": 230,
-            "offset_start": 21,
-            "offset_end": 52,
+            "offset_start": 4,   # immediately after first actual sequence
+            "offset_end": 8,     # actual cumulative length, not nominal 52
             "span": 31,
             "sequence_length": 4,
         },
     ]
+
+
+def test_attach_dotplot_images_block_offsets_use_actual_sequence_lengths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Block offsets must reflect the actual fetched sequence length, not the nominal span.
+
+    When a region extends past the chromosome end, pysam returns fewer bases than
+    region.end - region.start + 1.  The matrix is built from those shorter sequences,
+    so the extent and pink-line coordinates must use the actual lengths; otherwise the
+    pink boundary line is drawn far to the right of the actual chr14/chr20 junction.
+    """
+    # chr14 region nominally 1,740,001 bp but only 1,493,719 bases returned (past chrom end).
+    # chr20 region nominally and actually 1,300,001 bp.
+    first_region = Region("chr14", 105_550_000, 107_290_000, "chr14:105550000-107290000")
+    second_region = Region("chr20", 39_500_000, 40_800_000, "chr20:39500000-40800000")
+    region_data = [{"region": first_region}, {"region": second_region}]
+
+    chr14_actual = "A" * 1_493_719   # truncated at chromosome end
+    chr20_actual = "C" * 1_300_001
+
+    def fetch_reference(_ref: str, region: Region) -> str:
+        return chr14_actual if region is first_region else chr20_actual
+
+    monkeypatch.setattr(workflow, "fetch_reference_sequence", fetch_reference)
+    monkeypatch.setattr(workflow, "compute_self_identity", lambda _s: np.eye(2, dtype=np.float32))
+
+    workflow._attach_dotplot_images(region_data, "ref.fa")
+
+    payload = region_data[0]["dotplot_payload"]
+    blocks = payload["blocks"]
+
+    # Block offsets must be built from actual sequence lengths, not nominal spans.
+    assert blocks[0]["offset_start"] == 0
+    assert blocks[0]["offset_end"] == 1_493_719, (
+        f"chr14 block offset_end should be actual seq length 1,493,719, "
+        f"got {blocks[0]['offset_end']:,}"
+    )
+    assert blocks[1]["offset_start"] == 1_493_719
+    assert blocks[1]["offset_end"] == 1_493_719 + 1_300_001
+
+    # total_span in the payload must also reflect actual sequence total.
+    assert payload["total_span"] == 1_493_719 + 1_300_001
+
+
+def test_attach_dotplot_images_includes_individual_payloads_for_multi_region(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_region = Region("chr1", 100, 120, "chr1:100-120")
+    second_region = Region("chr2", 200, 230, "chr2:200-230")
+    region_data = [{"region": first_region}, {"region": second_region}]
+    matrices_by_seq: dict[str, np.ndarray] = {}
+
+    def fetch_reference(_ref: str, region: Region) -> str:
+        return "AAAA" if region == first_region else "CCCC"
+
+    def compute_identity(sequence: str) -> np.ndarray:
+        m = np.eye(2, dtype=np.float32) * len(matrices_by_seq)
+        matrices_by_seq[sequence] = m
+        return m
+
+    monkeypatch.setattr(workflow, "fetch_reference_sequence", fetch_reference)
+    monkeypatch.setattr(workflow, "compute_self_identity", compute_identity)
+
+    workflow._attach_dotplot_images(region_data, "ref.fa")
+
+    payload = region_data[0]["dotplot_payload"]
+    assert "individual_payloads" in payload
+    indivs = payload["individual_payloads"]
+    assert len(indivs) == 2
+    assert indivs[0]["region"] is first_region
+    assert indivs[1]["region"] is second_region
+    assert indivs[0]["matrix"] is matrices_by_seq["AAAA"]
+    assert indivs[1]["matrix"] is matrices_by_seq["CCCC"]
+    assert indivs[0]["label"] == "chr1:100-120"
+    assert indivs[1]["label"] == "chr2:200-230"
+
+
+def test_attach_dotplot_images_skips_individual_payloads_for_single_region(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    region = Region("chr1", 100, 120, "chr1:100-120")
+    region_data = [{"region": region}]
+
+    monkeypatch.setattr(workflow, "fetch_reference_sequence", lambda _r, _reg: "AAAA")
+    monkeypatch.setattr(workflow, "compute_self_identity", lambda _s: np.eye(2, dtype=np.float32))
+
+    workflow._attach_dotplot_images(region_data, "ref.fa")
+
+    payload = region_data[0]["dotplot_payload"]
+    assert payload["individual_payloads"] == []
+
+
+def test_attach_dotplot_images_adds_repeat_density_to_each_region(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_region = Region("chr1", 100, 200, "chr1:100-200")
+    second_region = Region("chr2", 300, 400, "chr2:300-400")
+    region_data = [{"region": first_region}, {"region": second_region}]
+
+    monkeypatch.setattr(workflow, "fetch_reference_sequence", lambda _r, _reg: "ACGT" * 25)
+
+    workflow._attach_dotplot_images(region_data, "ref.fa")
+
+    assert "repeat_density" in region_data[0]
+    assert "repeat_density" in region_data[1]
+    assert isinstance(region_data[0]["repeat_density"], np.ndarray)
+    assert isinstance(region_data[1]["repeat_density"], np.ndarray)
+    assert region_data[0]["repeat_density"].shape == (512,)
+    assert region_data[1]["repeat_density"].shape == (512,)
+
+
+def test_attach_dotplot_images_single_region_label_is_coordinate_string(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    region = Region("chr1", 100, 120, "chr1:100-120")
+    region_data = [{"region": region}]
+
+    monkeypatch.setattr(workflow, "fetch_reference_sequence", lambda _r, _reg: "AAAA")
+    monkeypatch.setattr(workflow, "compute_self_identity", lambda _s: np.eye(2, dtype=np.float32))
+
+    workflow._attach_dotplot_images(region_data, "ref.fa")
+
+    payload = region_data[0]["dotplot_payload"]
+    assert "Regions are concatenated" not in payload["label"]
+    assert payload["label"] == "chr1:100-120"
+
+
+def test_attach_dotplot_images_adds_repeat_density_for_single_region(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    region = Region("chr1", 100, 200, "chr1:100-200")
+    region_data = [{"region": region}]
+
+    monkeypatch.setattr(workflow, "fetch_reference_sequence", lambda _r, _reg: "ACGT" * 25)
+
+    workflow._attach_dotplot_images(region_data, "ref.fa")
+
+    assert "repeat_density" in region_data[0]
+    assert isinstance(region_data[0]["repeat_density"], np.ndarray)
+    assert region_data[0]["repeat_density"].shape == (512,)
 
 
 def test_attach_dotplot_images_skips_oversized_and_missing_reference(

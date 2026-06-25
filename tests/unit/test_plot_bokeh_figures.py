@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import base64
+import unittest.mock
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from bokeh.models import (
     BoxZoomTool,
+    Button,
     Checkbox,
     ColumnDataSource,
     CustomJSTicker,
@@ -33,6 +36,7 @@ from orographer.plot_bokeh.figures import (
     create_dotplot_thumbnail,
     create_genomic_x_axis_strip,
     create_global_checkbox_controls,
+    create_repeat_density_figure,
     update_coverage_y_range,
 )
 from orographer.utils import Region
@@ -76,6 +80,7 @@ def test_gene_track_uses_gtf_inclusive_end_as_interval_boundary() -> None:
     gene = SimpleNamespace(
         gene_id="G1",
         gene_name="Gene1",
+        chrom="chr1",
         start=100,
         end=250,
         strand="+",
@@ -93,6 +98,14 @@ def test_gene_track_uses_gtf_inclusive_end_as_interval_boundary() -> None:
     assert len(quad_sources) == 1
     assert quad_sources[0].data["left"] == [100, 200]
     assert quad_sources[0].data["right"] == [151, 251]
+    assert quad_sources[0].data["exon_coordinates"] == [
+        "chr1:100-150 (51 bp)",
+        "chr1:200-250 (51 bp)",
+    ]
+    assert quad_sources[0].data["isoform_coordinates"] == [
+        "chr1:100-250 (151 bp)",
+        "chr1:100-250 (151 bp)",
+    ]
 
 
 def test_gene_track_keeps_first_duplicate_gene_annotation() -> None:
@@ -274,7 +287,7 @@ def test_gene_track_overview_rows_do_not_reserve_all_label_widths() -> None:
     ]
     plot_figure = figure(x_range=(1, 2_000_000), y_range=(4, 0))
 
-    gene_track_height = add_gene_track(plot_figure, genes, 0, 1, 2_000_000)
+    gene_track_height, _gene_sources = add_gene_track(plot_figure, genes, 0, 1, 2_000_000)
 
     assert gene_track_height == 2.2
 
@@ -472,11 +485,17 @@ def test_render_combined_dotplot_png_data_url_returns_valid_png() -> None:
     blocks = [
         {
             "label": "chr8:0.0-0.0 Mb",
+            "chromosome": "chr8",
+            "start": 0,
+            "end": 40,
             "offset_start": 0,
             "offset_end": 40,
         },
         {
             "label": "chr14:0.0-0.0 Mb",
+            "chromosome": "chr14",
+            "start": 0,
+            "end": 40,
             "offset_start": 40,
             "offset_end": 80,
         },
@@ -492,6 +511,78 @@ def test_render_combined_dotplot_png_data_url_returns_valid_png() -> None:
     )
 
     assert _decode_png_url(modal_url).startswith(PNG_SIGNATURE)
+
+
+def test_render_dotplot_png_boundary_line_at_exact_offset_end() -> None:
+    """Pink boundary line must be at the exact offset_end coordinate, not bin-snapped.
+
+    With resolution=8 and an asymmetric 700/1000 split, the old _bin_boundary formula
+    returned 750.0 instead of 700.0 — a 50-unit error visible as a misaligned pink line.
+    The line must sit at float(block["offset_end"]) because the imshow extent maps
+    offset 0→total_len directly to visual data coordinates.
+    """
+    from matplotlib.figure import Figure
+
+    matrix = np.eye(8, dtype=np.float32)
+    region = Region("chr8", 0, 1000, "chr8:0-1000")
+    blocks = [
+        {
+            "label": "chr8:0.0-0.0 Mb",
+            "chromosome": "chr8",
+            "start": 0,
+            "end": 700,
+            "offset_start": 0,
+            "offset_end": 700,
+        },
+        {
+            "label": "chr14:0.0-0.0 Mb",
+            "chromosome": "chr14",
+            "start": 0,
+            "end": 300,
+            "offset_start": 700,
+            "offset_end": 1000,
+        },
+    ]
+
+    captured_vline_xs: list[float] = []
+    captured_hline_ys: list[float] = []
+    original_add_subplot = Figure.add_subplot
+
+    def patched_add_subplot(self, *args, **kwargs):
+        ax = original_add_subplot(self, *args, **kwargs)
+        orig_axvline = ax.axvline
+        orig_axhline = ax.axhline
+
+        def capture_axvline(x, **kw):
+            captured_vline_xs.append(float(x))
+            return orig_axvline(x, **kw)
+
+        def capture_axhline(y, **kw):
+            captured_hline_ys.append(float(y))
+            return orig_axhline(y, **kw)
+
+        ax.axvline = capture_axvline
+        ax.axhline = capture_axhline
+        return ax
+
+    with unittest.mock.patch.object(Figure, "add_subplot", patched_add_subplot):
+        _render_dotplot_png_data_url(
+            matrix,
+            region,
+            with_axes=False,
+            figure_size=(1.0, 1.0),
+            dpi=64,
+            blocks=blocks,
+        )
+
+    # Left edge of the first chr20 bin: floor(700 * 8 / 1000) * 1000/8 = 5 * 125 = 625.0.
+    # This aligns the pink line with where the N-masked grey area visually ends.
+    assert captured_vline_xs == [pytest.approx(625.0)], (
+        f"axvline called with {captured_vline_xs}, expected [625.0]"
+    )
+    assert captured_hline_ys == [pytest.approx(625.0)], (
+        f"axhline called with {captured_hline_ys}, expected [625.0]"
+    )
 
 
 def test_create_dotplot_thumbnail_returns_single_clickable_thumbnail_button() -> None:
@@ -517,6 +608,9 @@ def test_create_combined_dotplot_thumbnail_uses_combined_modal_title() -> None:
     blocks = [
         {
             "label": "chr1:0.0-0.0 Mb",
+            "chromosome": "chr1",
+            "start": 100,
+            "end": 104,
             "offset_start": 0,
             "offset_end": 4,
         }
@@ -535,13 +629,79 @@ def test_create_combined_dotplot_thumbnail_uses_combined_modal_title() -> None:
 
     assert callback.args["title_text"] == "Combined reference self-identity dotplot"
     assert callback.args["region_label"] == "Regions are concatenated: chr1:100-104"
+    assert callback.args["individual_images"] == []
+
+
+def test_create_dotplot_thumbnail_with_individual_payloads_passes_images_to_callback() -> None:
+    matrix = np.eye(8, dtype=np.float32)
+    region = Region("chr1", 100, 108, "chr1:100-108")
+    blocks = [
+        {
+            "label": "chr1:0.0-0.0 Mb",
+            "chromosome": "chr1",
+            "start": 100,
+            "end": 104,
+            "offset_start": 0,
+            "offset_end": 4,
+        },
+        {
+            "label": "chr2:0.0-0.0 Mb",
+            "chromosome": "chr2",
+            "start": 200,
+            "end": 204,
+            "offset_start": 4,
+            "offset_end": 8,
+        },
+    ]
+    individual_payloads = [
+        {
+            "matrix": np.eye(4, dtype=np.float32),
+            "region": Region("chr1", 100, 104, "chr1:100-104"),
+            "label": "chr1:100-104",
+            "title": "chr1 self-identity",
+        },
+        {
+            "matrix": np.eye(4, dtype=np.float32),
+            "region": Region("chr2", 200, 204, "chr2:200-204"),
+            "label": "chr2:200-204",
+            "title": "chr2 self-identity",
+        },
+    ]
+
+    thumbnail = create_dotplot_thumbnail(
+        None,
+        matrix,
+        region,
+        size=32,
+        blocks=blocks,
+        individual_payloads=individual_payloads,
+    )
+    callback = thumbnail.js_event_callbacks["button_click"][0]
+    indiv = callback.args["individual_images"]
+
+    assert len(indiv) == 2
+    assert indiv[0]["label"] == "chr1:100-104"
+    assert indiv[0]["title"] == "chr1 self-identity"
+    assert indiv[0]["url"].startswith("data:image/png;base64,")
+    assert indiv[1]["label"] == "chr2:200-204"
+    assert indiv[1]["url"].startswith("data:image/png;base64,")
+
+
+def test_create_dotplot_thumbnail_without_individual_payloads_passes_empty_list() -> None:
+    matrix = np.eye(4, dtype=np.float32)
+    region = Region("chr1", 100, 104, "chr1:100-104")
+
+    thumbnail = create_dotplot_thumbnail(None, matrix, region, size=32)
+    callback = thumbnail.js_event_callbacks["button_click"][0]
+
+    assert callback.args["individual_images"] == []
 
 
 def test_create_coordinate_display_adds_phase_set_marker_checkbox() -> None:
     plot_figure = figure(x_range=(100, 200))
     phase_renderer = plot_figure.segment([120], [0], [120], [1])
 
-    controls, _hide_1bp_checkbox = create_coordinate_display(
+    controls, _hide_1bp_checkbox, _coord_input = create_coordinate_display(
         plot_figure,
         "chr1",
         100,
@@ -554,6 +714,21 @@ def test_create_coordinate_display_adds_phase_set_marker_checkbox() -> None:
     callbacks = checkbox.js_property_callbacks["change:active"]
 
     assert callbacks[0].args["phase_set_marker_renderers"] == [phase_renderer]
+
+
+def test_create_coordinate_display_enables_hold_for_pan_arrows() -> None:
+    plot_figure = figure(x_range=(100, 200))
+
+    controls, _hide_1bp_checkbox, _cursor_guide_checkbox = create_coordinate_display(
+        plot_figure, "chr1", 100, 200
+    )
+
+    hold_buttons = [
+        button.label
+        for button in controls.select({"type": Button})
+        if "orographer-click-hold" in button.tags
+    ]
+    assert hold_buttons == ["\u2039", "\u203a"]
 
 
 def test_create_global_checkbox_controls_groups_evidence_and_display_controls() -> None:
@@ -626,3 +801,39 @@ def test_cursor_guide_adds_span_and_event_callbacks() -> None:
     assert "mousemove" in plot_figure.js_event_callbacks
     assert "mouseleave" in plot_figure.js_event_callbacks
     assert "change:active" in checkbox.js_property_callbacks
+
+
+def test_create_repeat_density_figure_returns_figure() -> None:
+    main = figure(x_range=(1_000, 2_000))
+    density = np.zeros(512, dtype=np.float32)
+    density[100] = 50.0
+    fig, _src = create_repeat_density_figure(main.x_range, density, 1_000, 2_000)
+    assert hasattr(fig, "renderers") and hasattr(fig, "x_range")
+
+
+def test_create_repeat_density_figure_shares_x_range() -> None:
+    main = figure(x_range=(500, 1_500))
+    density = np.zeros(512, dtype=np.float32)
+    fig, _src = create_repeat_density_figure(main.x_range, density, 500, 1_500)
+    assert fig.x_range is main.x_range
+
+
+def test_create_repeat_density_figure_has_glyph_renderer() -> None:
+    main = figure(x_range=(0, 10_000))
+    density = np.ones(512, dtype=np.float32) * 3.0
+    fig, _src = create_repeat_density_figure(main.x_range, density, 0, 10_000)
+    assert len(fig.renderers) > 0
+
+
+def test_create_repeat_density_figure_height() -> None:
+    main = figure(x_range=(0, 5_000))
+    density = np.zeros(512, dtype=np.float32)
+    fig, _src = create_repeat_density_figure(main.x_range, density, 0, 5_000)
+    assert fig.height < 100
+
+
+def test_create_repeat_density_figure_has_ident_label() -> None:
+    main = figure(x_range=(0, 5_000))
+    density = np.zeros(512, dtype=np.float32)
+    fig, _src = create_repeat_density_figure(main.x_range, density, 0, 5_000)
+    assert fig.yaxis[0].axis_label == "Ident"

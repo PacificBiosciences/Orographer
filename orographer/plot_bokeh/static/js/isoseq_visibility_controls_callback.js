@@ -359,29 +359,33 @@ function applyTranscriptVisibility(source) {
     if (data.alpha) {
         data.alpha = data.alpha.map(function (_oldValue, rowIndex) {
             const baseAlpha = data.base_alpha ? data.base_alpha[rowIndex] : 0.86;
-            if (!hasSelection) return baseAlpha;
+            const isUnassigned = String(data.transcript_id[rowIndex]) == "UNASSIGNED";
+            if (!hasSelection) {
+                return hideIsoforms ? (isUnassigned ? baseAlpha : 0) : baseAlpha;
+            }
             if (!hideIsoforms) {
                 return String(data.transcript_id[rowIndex]) == String(selectedTranscriptId)
                     ? baseAlpha
                     : 0.24;
             }
-            return String(data.transcript_id[rowIndex]) == String(selectedTranscriptId)
-                ? baseAlpha
-                : 0;
+            const isSelected = String(data.transcript_id[rowIndex]) == String(selectedTranscriptId);
+            return (isSelected ? true : isUnassigned) ? baseAlpha : 0;
         });
     }
     if (data.line_alpha) {
         data.line_alpha = data.line_alpha.map(function (_oldValue, rowIndex) {
             const baseAlpha = data.base_line_alpha ? data.base_line_alpha[rowIndex] : 1;
-            if (!hasSelection) return baseAlpha;
+            const isUnassigned = String(data.transcript_id[rowIndex]) == "UNASSIGNED";
+            if (!hasSelection) {
+                return hideIsoforms ? (isUnassigned ? baseAlpha : 0) : baseAlpha;
+            }
             if (!hideIsoforms) {
                 return String(data.transcript_id[rowIndex]) == String(selectedTranscriptId)
                     ? baseAlpha
                     : 0.28;
             }
-            return String(data.transcript_id[rowIndex]) == String(selectedTranscriptId)
-                ? baseAlpha
-                : 0;
+            const isSelected = String(data.transcript_id[rowIndex]) == String(selectedTranscriptId);
+            return (isSelected ? true : isUnassigned) ? baseAlpha : 0;
         });
     }
     source.change.emit();
@@ -398,16 +402,19 @@ function applyFeatureVisibility(source, selectedState, alphaColumn, visibleAlpha
     if (!data[alphaColumn]) return;
     const hideIsoforms = hide_unselected_isoforms_checkbox.active;
     data[alphaColumn] = data[alphaColumn].map(function (_oldValue, rowIndex) {
-        if (!selectedState.hasSelection) return visibleAlpha;
+        const isUnassigned = String(data.transcript_id[rowIndex]) == "UNASSIGNED";
+        if (!selectedState.hasSelection) {
+            return hideIsoforms ? (isUnassigned ? visibleAlpha : 0) : visibleAlpha;
+        }
         if (!hideIsoforms) {
             return String(data.transcript_id[rowIndex])
                 == String(selectedState.selectedTranscriptId)
                 ? visibleAlpha
                 : contextAlpha;
         }
-        return String(data.transcript_id[rowIndex]) == String(selectedState.selectedTranscriptId)
-            ? visibleAlpha
-            : 0;
+        const isSelected = String(data.transcript_id[rowIndex])
+            == String(selectedState.selectedTranscriptId);
+        return (isSelected ? true : isUnassigned) ? visibleAlpha : 0;
     });
     source.change.emit();
 }
@@ -423,7 +430,7 @@ function applyReadVisibility(source, visibleAlphaByColumn, selectedReads, yByRea
         const visibleAlpha = visibleAlphaByColumn[column];
         data[column] = data[column].map(function (_oldValue, rowIndex) {
             if (!hideReads) return visibleAlpha;
-            if (!hasReadSelection) return visibleAlpha;
+            if (!hasReadSelection) return 0;
             const readName = data.read_name ? data.read_name[rowIndex] : "";
             return selectedReads.names[readName] ? visibleAlpha : 0;
         });
@@ -505,7 +512,7 @@ read_arrow_sources.forEach(function (source, sourceIndex) {
                 selectedReadCount(selectedReads)
             );
         } else {
-            resizeSelectedView(source, plot_figures[sourceIndex], uniqueReadCount(source));
+            resizeSelectedView(source, plot_figures[sourceIndex], 0);
         }
     } else {
         resizeSelectedView(source, plot_figures[sourceIndex], uniqueReadCount(source));

@@ -10,6 +10,7 @@ from .sources import add_read_chevron_data, empty_arrow_source_data
 from .utils import PLOT_CONFIG
 
 ISOSEQ_READ_PAGE_SIZE = 100
+ISOSEQ_COMPARISON_READ_PAGE_SIZE = 50
 ISOSEQ_PAGE_TEMPLATE_TOKEN = "__PAGE__"
 ISOSEQ_READ_SHARD_SIZE = 2000
 
@@ -51,6 +52,20 @@ def intron_direction_positions(
         intron_start + (intron_length * (marker_idx + 1) / (marker_count + 1))
         for marker_idx in range(marker_count)
     ]
+
+
+def single_exon_direction_position(
+    exon_start: int,
+    exon_end: int,
+    coordinate_start: int,
+    coordinate_end: int,
+) -> float | None:
+    """Return one visible x position for a single-exon transcript strand marker."""
+    visible_start = max(exon_start, coordinate_start)
+    visible_end = min(exon_end + 1, coordinate_end + 1)
+    if visible_start >= visible_end:
+        return None
+    return (visible_start + visible_end) / 2
 
 
 def safe_chunk_token(value: Any) -> str:
@@ -107,7 +122,9 @@ def read_shard_record(read_name: str, segments: list[Any], read_metadata: dict) 
     ]
 
 
-def build_layout(groups: list[dict], _segments_by_read: dict) -> dict:
+def build_layout(
+    groups: list[dict], _segments_by_read: dict, annotation_label: str = "Primary GTF"
+) -> dict:
     """Return row positions for IsoSeq transcript/read groups."""
     transcript_height = 0.36
     read_height = 0.24
@@ -133,6 +150,7 @@ def build_layout(groups: list[dict], _segments_by_read: dict) -> dict:
                 "gene_name": transcript.gene_name if transcript else "Unassigned",
                 "transcript_id": transcript.transcript_id if transcript else "UNASSIGNED",
                 "group_id": group["group_id"],
+                "annotation_label": annotation_label,
             }
 
     selected_read_y_start = y + 1.0
@@ -157,7 +175,7 @@ def add_metadata_to_sources(
     read_metadata: dict,
 ) -> None:
     """Attach transcript/gene metadata to read glyph and label sources."""
-    for key in ("gene_id", "gene_name", "transcript_id", "group_id"):
+    for key in ("gene_id", "gene_name", "transcript_id", "group_id", "annotation_label"):
         arrow_data[key] = []
     for read_name in arrow_data.get("read_name", []):
         meta = read_metadata.get(read_name, {})
@@ -165,12 +183,14 @@ def add_metadata_to_sources(
         arrow_data["gene_name"].append(meta.get("gene_name", ""))
         arrow_data["transcript_id"].append(meta.get("transcript_id", ""))
         arrow_data["group_id"].append(meta.get("group_id", ""))
+        arrow_data["annotation_label"].append(meta.get("annotation_label", ""))
 
     for info in clickable_data.get("customdata", []):
         meta = read_metadata.get(info.get("read_name", ""), {})
         info["gene_id"] = meta.get("gene_id", "")
         info["gene_name"] = meta.get("gene_name", "")
         info["transcript_id"] = meta.get("transcript_id", "")
+        info["annotation_label"] = meta.get("annotation_label", "")
 
 
 def normalise_arrow_source_data(arrow_data: dict) -> dict:

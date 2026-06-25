@@ -6,6 +6,27 @@ from collections.abc import Mapping, Sequence
 from ..utils import COMPLEX_SV_REGION_TYPE, ISOSEQ_REGION_TYPE, PARAPHASE_REGION_TYPE
 from .utils import PLOT_CONFIG, get_haplotype_color
 
+CHEVRON_TIP_FRACTION_CANDIDATES = (
+    PLOT_CONFIG["read_chevron_tip_fraction"],
+    0.65,
+    0.9,
+    0.75,
+    0.7,
+    0.6,
+    0.55,
+    0.5,
+    0.45,
+    0.4,
+    0.35,
+    0.3,
+    0.25,
+    0.2,
+    0.15,
+    0.1,
+    0.05,
+    0.95,
+)
+
 
 def get_segment_color(segment, region_type):
     """Color for a segment (YC tag or haplotype/strand; paraphase no YC -> grey)."""
@@ -39,6 +60,59 @@ def format_alignment_coordinates(chrom: str, start: int, end: int) -> str:
 def display_block_coordinates(block_start: int, block_end: int) -> tuple[int, int]:
     """Convert a 0-based half-open reference block to displayed coordinates."""
     return block_start + 1, block_end + 1
+
+
+def visible_deletion_ranges(
+    segment: object,
+    block_start: int,
+    block_end: int,
+    coordinate_start: int,
+    coordinate_end: int,
+) -> list[tuple[int, int]]:
+    """Return displayed deletion ranges that overlap one rendered read block."""
+    ranges = []
+    for deletion_start, deletion_end in getattr(segment, "deletions", []):
+        display_start = deletion_start + 1
+        display_end = deletion_end - 1
+        if display_start > coordinate_end or display_end < coordinate_start:
+            continue
+        if display_start > block_end or display_end < block_start:
+            continue
+        ranges.append(
+            (
+                max(display_start, coordinate_start, block_start),
+                min(display_end, coordinate_end, block_end),
+            )
+        )
+    return ranges
+
+
+def chevron_tip_fraction(
+    x0: int,
+    x1: int,
+    deletion_ranges: list[tuple[int, int]],
+    coordinate_start: int,
+    coordinate_end: int,
+) -> float:
+    """Return a read chevron tip fraction that avoids deletion glyph positions."""
+    if not deletion_ranges:
+        return PLOT_CONFIG["read_chevron_tip_fraction"]
+    span = x1 - x0
+    coordinate_span = abs(coordinate_end - coordinate_start)
+    target_span = (
+        coordinate_span
+        / PLOT_CONFIG["read_chevron_plot_width_px"]
+        * PLOT_CONFIG["read_chevron_target_px"]
+    )
+    glyph_span = min(max(1.0, target_span), abs(span) / 2)
+    for fraction in CHEVRON_TIP_FRACTION_CANDIDATES:
+        tip = x0 + span * fraction
+        base = tip - math.copysign(glyph_span, span)
+        glyph_start = min(base, tip)
+        glyph_end = max(base, tip)
+        if not any(start <= glyph_end and glyph_start <= end for start, end in deletion_ranges):
+            return fraction
+    return PLOT_CONFIG["read_chevron_tip_fraction"]
 
 
 def get_base_color(base):
@@ -406,11 +480,6 @@ def add_connector_rows(
         connector_data["has_split_alignment"].append(has_split_alignment)
         connector_data["has_multiregion_connection"].append(has_multiregion_connection)
         connector_data["read_filter_alpha"].append(1.0)
-        connector_data["connector_line_alpha"].append(0.9)
-        connector_data["connector_selected_alpha"].append(1.0)
-        connector_data["connector_nonselected_alpha"].append(
-            PLOT_CONFIG["connector_nonselection_alpha"]
-        )
 
 
 def empty_same_region_connector_data():
@@ -425,9 +494,6 @@ def empty_same_region_connector_data():
         "has_split_alignment": [],
         "has_multiregion_connection": [],
         "read_filter_alpha": [],
-        "connector_line_alpha": [],
-        "connector_selected_alpha": [],
-        "connector_nonselected_alpha": [],
     }
 
 
@@ -629,9 +695,6 @@ def add_same_region_connector_lines(line_data, visible_segment_endpoints, connec
         line_data["has_split_alignment"].append(request["has_split_alignment"])
         line_data["has_multiregion_connection"].append(request["has_multiregion_connection"])
         line_data["read_filter_alpha"].append(1.0)
-        line_data["connector_line_alpha"].append(PLOT_CONFIG["connector_line_alpha"])
-        line_data["connector_selected_alpha"].append(PLOT_CONFIG["connector_selection_line_alpha"])
-        line_data["connector_nonselected_alpha"].append(PLOT_CONFIG["connector_nonselection_alpha"])
 
 
 def process_segments(
@@ -669,6 +732,7 @@ def process_segments(
     arrow_has_split, arrow_has_multiregion, arrow_filter_alpha = [], [], []
     arrow_line_alphas, arrowhead_alphas = [], []
     arrow_selected_alphas, arrow_nonselected_alphas = [], []
+    arrow_chevron_tip_fractions = []
     arrow_y0_list, arrow_y1_list = [], []
     same_region_connector_data = empty_same_region_connector_data()
     visible_segment_endpoints = {}
@@ -695,16 +759,12 @@ def process_segments(
         "has_split_alignment": [],
         "has_multiregion_connection": [],
         "read_filter_alpha": [],
-        "connector_line_alpha": [],
-        "connector_selected_alpha": [],
-        "connector_nonselected_alpha": [],
     }
     clickable_x, clickable_y, clickable_customdata = [], [], []
     mismatch_x, mismatch_y, mismatch_alt, mismatch_color = [], [], [], []
     mismatch_read_names = []
     mismatch_layout_read_names = []
-    mismatch_split, mismatch_multiregion, mismatch_filter_alpha = [], [], []
-    mismatch_fill_alpha, mismatch_line_alpha, mismatch_text_alpha = [], [], []
+    mismatch_split, mismatch_multiregion = [], []
     insertion_x, insertion_y, insertion_size, insertion_count, insertion_is_1bp = (
         [],
         [],
@@ -712,15 +772,13 @@ def process_segments(
         [],
         [],
     )
-    insertion_split, insertion_multiregion, insertion_filter_alpha = [], [], []
+    insertion_split, insertion_multiregion = [], []
     insertion_read_names = []
     insertion_layout_read_names = []
-    insertion_fill_alpha, insertion_line_alpha, insertion_text_alpha = [], [], []
     deletion_x0, deletion_x1, deletion_y, deletion_is_1bp = [], [], [], []
     deletion_read_names = []
     deletion_layout_read_names = []
-    deletion_split, deletion_multiregion, deletion_filter_alpha = [], [], []
-    deletion_line_alpha = []
+    deletion_split, deletion_multiregion = [], []
 
     for read_name in read_names:
         segments = segments_by_read[read_name]
@@ -818,13 +876,25 @@ def process_segments(
                     arrow_fwd_read_starts.append(getattr(segment, "fwd_read_start", 0))
                     arrow_fwd_read_ends.append(getattr(segment, "fwd_read_end", 0))
                     arrow_source_kinds.append("arrow")
+                    deletion_ranges = visible_deletion_ranges(
+                        segment,
+                        min(plot_start, plot_end),
+                        max(plot_start, plot_end),
+                        coordinate_start,
+                        coordinate_end,
+                    )
+                    arrow_chevron_tip_fractions.append(
+                        chevron_tip_fraction(
+                            arrow_x0,
+                            arrow_x1,
+                            deletion_ranges,
+                            coordinate_start,
+                            coordinate_end,
+                        )
+                    )
                     arrow_has_split.append(has_split_alignment)
                     arrow_has_multiregion.append(has_multiregion_connection)
                     arrow_filter_alpha.append(1.0)
-                    arrow_line_alphas.append(PLOT_CONFIG["arrow_line_alpha"])
-                    arrowhead_alphas.append(PLOT_CONFIG["arrowhead_fill_alpha"])
-                    arrow_selected_alphas.append(1.0)
-                    arrow_nonselected_alphas.append(PLOT_CONFIG["arrow_nonselection_line_alpha"])
                     if is_isoseq:
                         strand_str = "Forward (+)" if segment.is_fwd_strand else "Reverse (-)"
                         haplotype_str = (
@@ -896,10 +966,6 @@ def process_segments(
                             mismatch_layout_read_names.append(read_name)
                             mismatch_split.append(has_split_alignment)
                             mismatch_multiregion.append(has_multiregion_connection)
-                            mismatch_filter_alpha.append(1.0)
-                            mismatch_fill_alpha.append(PLOT_CONFIG["mismatch_fill_alpha"])
-                            mismatch_line_alpha.append(PLOT_CONFIG["mismatch_line_alpha"])
-                            mismatch_text_alpha.append(1.0)
                 if hasattr(segment, "insertions") and segment.insertions:
                     for ref_pos, inserted_bases in segment.insertions:
                         ref_pos_1based = ref_pos + 1
@@ -921,10 +987,6 @@ def process_segments(
                             insertion_layout_read_names.append(read_name)
                             insertion_split.append(has_split_alignment)
                             insertion_multiregion.append(has_multiregion_connection)
-                            insertion_filter_alpha.append(1.0)
-                            insertion_fill_alpha.append(PLOT_CONFIG["insertion_fill_alpha"])
-                            insertion_line_alpha.append(PLOT_CONFIG["insertion_line_alpha"])
-                            insertion_text_alpha.append(1.0)
                 if hasattr(segment, "deletions") and segment.deletions:
                     for del_start, del_end in segment.deletions:
                         del_start_1based = del_start + 1
@@ -943,8 +1005,6 @@ def process_segments(
                             deletion_layout_read_names.append(read_name)
                             deletion_split.append(has_split_alignment)
                             deletion_multiregion.append(has_multiregion_connection)
-                            deletion_filter_alpha.append(1.0)
-                            deletion_line_alpha.append(PLOT_CONFIG["deletion_line_alpha"])
 
                 strand_str = "Forward (+)" if segment.is_fwd_strand else "Reverse (-)"
                 haplotype_str = (
@@ -1009,13 +1069,10 @@ def process_segments(
             "fwd_read_start": arrow_fwd_read_starts,
             "fwd_read_end": arrow_fwd_read_ends,
             "source_kind": arrow_source_kinds,
+            "chevron_tip_fraction": arrow_chevron_tip_fractions,
             "has_split_alignment": arrow_has_split,
             "has_multiregion_connection": arrow_has_multiregion,
             "read_filter_alpha": arrow_filter_alpha,
-            "arrow_line_alpha": arrow_line_alphas,
-            "arrowhead_alpha": arrowhead_alphas,
-            "arrow_selected_alpha": arrow_selected_alphas,
-            "arrow_nonselected_alpha": arrow_nonselected_alphas,
         },
         {"x": clickable_x, "y": clickable_y, "customdata": clickable_customdata},
         {
@@ -1028,10 +1085,6 @@ def process_segments(
                 "layout_read_name": mismatch_layout_read_names,
                 "has_split_alignment": mismatch_split,
                 "has_multiregion_connection": mismatch_multiregion,
-                "read_filter_alpha": mismatch_filter_alpha,
-                "marker_fill_alpha": mismatch_fill_alpha,
-                "marker_line_alpha": mismatch_line_alpha,
-                "text_alpha": mismatch_text_alpha,
             },
             "insertion": {
                 "x": insertion_x,
@@ -1043,10 +1096,6 @@ def process_segments(
                 "layout_read_name": insertion_layout_read_names,
                 "has_split_alignment": insertion_split,
                 "has_multiregion_connection": insertion_multiregion,
-                "read_filter_alpha": insertion_filter_alpha,
-                "marker_fill_alpha": insertion_fill_alpha,
-                "marker_line_alpha": insertion_line_alpha,
-                "text_alpha": insertion_text_alpha,
             },
             "deletion": {
                 "x0": deletion_x0,
@@ -1057,8 +1106,6 @@ def process_segments(
                 "layout_read_name": deletion_layout_read_names,
                 "has_split_alignment": deletion_split,
                 "has_multiregion_connection": deletion_multiregion,
-                "read_filter_alpha": deletion_filter_alpha,
-                "line_alpha": deletion_line_alpha,
             },
         },
         connector_data,

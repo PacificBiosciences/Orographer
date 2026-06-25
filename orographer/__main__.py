@@ -118,6 +118,13 @@ Examples:
     )
 
     plot_parser.add_argument(
+        "--comparison-gtf",
+        help=argparse.SUPPRESS,
+        required=False,
+        default=None,
+    )
+
+    plot_parser.add_argument(
         "--vcf",
         help=(
             "Path to VCF file (gzipped or uncompressed) for variant visualization "
@@ -283,6 +290,8 @@ Examples:
             parser.error("--region-connection-threshold must be at least 1.")
         if args.region_type == ISOSEQ_REGION_TYPE and not args.gtf:
             parser.error("--gtf is required when --region-type isoseq.")
+        if args.comparison_gtf and args.region_type != ISOSEQ_REGION_TYPE:
+            parser.error("--comparison-gtf can only be used with --region-type isoseq.")
 
     return args
 
@@ -330,6 +339,15 @@ def run_plot_command(args):
         )
 
     output_config = OutputConfig(args.outdir, args.prefix)
+    orographer_kwargs = {
+        "show_dotplot": not args.no_dotplot,
+        "region_connection_threshold": args.region_connection_threshold,
+        "no_expansion": args.no_expansion,
+        "force_isoseq": getattr(args, "force_isoseq", False),
+    }
+    comparison_gtf = getattr(args, "comparison_gtf", None)
+    if comparison_gtf:
+        orographer_kwargs["comparison_gtf_file"] = comparison_gtf
     try:
         orographer(
             args.region_type,
@@ -343,10 +361,7 @@ def run_plot_command(args):
             other_vcf_list,
             args.sample_label,
             other_sample_label_list,
-            show_dotplot=not args.no_dotplot,
-            region_connection_threshold=args.region_connection_threshold,
-            no_expansion=args.no_expansion,
-            force_isoseq=getattr(args, "force_isoseq", False),
+            **orographer_kwargs,
         )
     except ValueError as err:
         logger.error(str(err))

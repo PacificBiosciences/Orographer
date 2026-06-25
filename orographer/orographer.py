@@ -7,7 +7,7 @@ from .bam_parser import (
     validate_bam_file,
 )
 from .complex_sv import DEFAULT_REGION_CONNECTION_THRESHOLD, process_complex_sv
-from .dotplot import MAX_DOTPLOT_REGION_BP, compute_self_identity
+from .dotplot import MAX_DOTPLOT_REGION_BP, compute_repeat_density, compute_self_identity
 from .gtf_parser import parse_annotation_file
 from .isoseq import process_isoseq
 from .plot_bokeh import plot_reads_bokeh
@@ -155,15 +155,52 @@ def _attach_dotplot_images(region_data_list, reference_path):
         sequences.append(seq)
         block["sequence_length"] = len(seq)
 
-    region_data_list[0]["dotplot_payload"] = {
-        "matrix": compute_self_identity("".join(sequences)),
-        "blocks": blocks,
-        "total_span": total_bp,
-        "label": (
+    # Rebuild block offsets from actual sequence lengths. The nominal span
+    # (region.end - region.start + 1) can exceed what pysam returns when the
+    # region extends past the chromosome end; using the nominal value would
+    # place the pink boundary line far from the real sequence junction.
+    actual_offset = 0
+    for block, seq in zip(blocks, sequences, strict=True):
+        block["offset_start"] = actual_offset
+        block["offset_end"] = actual_offset + len(seq)
+        actual_offset = block["offset_end"]
+
+    individual_matrices = [compute_self_identity(seq) for seq in sequences]
+
+    individual_payloads = []
+    if len(region_data_list) > 1:
+        for ind_matrix, block, region_data in zip(individual_matrices, blocks, region_data_list):
+            individual_payloads.append(
+                {
+                    "matrix": ind_matrix,
+                    "region": region_data["region"],
+                    "label": block["coordinate_label"],
+                    "title": block["label"],
+                }
+            )
+
+    for ind_matrix, region_data in zip(individual_matrices, region_data_list):
+        region_data["repeat_density"] = compute_repeat_density(ind_matrix)
+
+    main_matrix = (
+        individual_matrices[0]
+        if len(sequences) == 1
+        else compute_self_identity("".join(sequences))
+    )
+    if len(sequences) == 1:
+        payload_label = blocks[0]["coordinate_label"]
+    else:
+        payload_label = (
             "Regions are concatenated in display order for reference comparison only: "
             + "; ".join(block["coordinate_label"] for block in blocks)
-        ),
+        )
+    region_data_list[0]["dotplot_payload"] = {
+        "matrix": main_matrix,
+        "blocks": blocks,
+        "total_span": blocks[-1]["offset_end"],
+        "label": payload_label,
         "title": "Combined reference self-identity dotplot",
+        "individual_payloads": individual_payloads,
     }
 
 
@@ -183,6 +220,7 @@ def orographer(
     region_connection_threshold: int = DEFAULT_REGION_CONNECTION_THRESHOLD,
     no_expansion: bool = False,
     force_isoseq: bool = False,
+    comparison_gtf_file: str | None = None,
 ):
     """Run alignment processing and plot.
 
@@ -248,6 +286,7 @@ def orographer(
             sample_labels=all_labels,
             region_type=region_type,
             force_isoseq=force_isoseq,
+            comparison_gtf_file=comparison_gtf_file,
         )
     elif region_type == PARAPHASE_REGION_TYPE:
         region_data_list = []

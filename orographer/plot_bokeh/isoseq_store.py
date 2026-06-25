@@ -17,6 +17,24 @@ def read_manifest_url(chunk_url_prefix: str | None, chunk_key: str) -> str:
     return f"{chunk_url_prefix}/{manifest_file}" if chunk_url_prefix else ""
 
 
+def all_assignments_url(chunk_url_prefix: str | None, assignments_key: str) -> str:
+    """Return a browser-loadable URL for the cross-annotation read assignments file."""
+    return f"{chunk_url_prefix}/{assignments_key}_all_assignments.json.gz" if chunk_url_prefix else ""
+
+
+def write_all_assignments(
+    chunk_dir: str | None,
+    assignments_key: str,
+    all_read_assignments: dict[str, list[dict]],
+) -> None:
+    """Write the cross-annotation read-to-isoform assignment lookup file."""
+    if not chunk_dir or not all_read_assignments:
+        return
+    os.makedirs(chunk_dir, exist_ok=True)
+    path = os.path.join(chunk_dir, f"{assignments_key}_all_assignments.json.gz")
+    write_json_gzip(path, {"assignments": all_read_assignments})
+
+
 def coverage_url(chunk_url_prefix: str | None, chunk_key: str) -> str:
     """Return a browser-loadable static JSON URL for one transcript coverage payload."""
     return f"{chunk_url_prefix}/{chunk_key}_coverage.json.gz" if chunk_url_prefix else ""
@@ -42,6 +60,7 @@ def write_read_store(
     read_records: list,
     read_id_by_name: dict[str, int],
     manifest_context: dict,
+    read_page_size: int = isoseq_data.ISOSEQ_READ_PAGE_SIZE,
 ) -> None:
     """Write sharded read records plus the read manifest for one BAM display row."""
     if not chunk_dir:
@@ -79,7 +98,7 @@ def write_read_store(
         }
     manifest = {
         "schema": "isoseq_read_manifest_v1",
-        "page_size": isoseq_data.ISOSEQ_READ_PAGE_SIZE,
+        "page_size": int(read_page_size),
         "shard_size": shard_size,
         "shards": shard_files,
         "groups": manifest_groups,
@@ -98,8 +117,12 @@ def prepare_lazy_chunks(
     region_idx: int,
     row_index: int,
     sample_label: str | None,
+    annotation_id: str = "primary",
+    annotation_label: str = "Primary GTF",
+    assignments_key: str | None = None,
     chunk_dir: str | None = None,
     chunk_url_prefix: str | None = None,
+    read_page_size: int = isoseq_data.ISOSEQ_READ_PAGE_SIZE,
 ) -> dict:
     """Write static sharded read data for browser-side IsoSeq lazy loading."""
     chunk_start_time = time.perf_counter()
@@ -114,7 +137,11 @@ def prepare_lazy_chunks(
         coordinate_start,
         coordinate_end,
     )
-    manifest_key = f"r{region_idx}_row{row_index}_reads"
+    if annotation_id == "primary":
+        manifest_key = f"r{region_idx}_row{row_index}_reads"
+    else:
+        annotation_token = isoseq_data.safe_chunk_token(annotation_id)
+        manifest_key = f"r{region_idx}_row{row_index}_{annotation_token}_reads"
     manifest_url = read_manifest_url(chunk_url_prefix, manifest_key)
     read_records = []
     read_id_by_name = {}
@@ -166,8 +193,12 @@ def prepare_lazy_chunks(
                 "region_idx": int(region_idx),
                 "row_index": int(row_index),
                 "sample_label": sample_label or "",
+                "annotation_label": annotation_label,
+                "all_assignments_url": all_assignments_url(chunk_url_prefix, assignments_key)
+                if assignments_key else "",
                 "selected_read_y_start": layout["selected_read_y_start"],
             },
+            read_page_size=read_page_size,
         )
     logger.debug(
         "IsoSeq static read-store generation for region %d row %d wrote %d read(s) in %.3fs.",

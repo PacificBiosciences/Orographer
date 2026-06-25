@@ -3,6 +3,9 @@ const gene_select = args.gene_select;
 const transcript_sources = args.transcript_sources;
 const read_sources = args.read_sources;
 const selectedGene = gene_select.value || "ALL";
+const selectedParts = String(selectedGene).split("::");
+const selectedAnnotation = selectedParts.length == 2 ? selectedParts[0] : "";
+const selectedGeneId = selectedParts.length == 2 ? selectedParts[1] : selectedGene;
 
 function rowVisible(data, rowIndex) {
     if (selectedGene == "ALL") {
@@ -11,7 +14,15 @@ function rowVisible(data, rowIndex) {
     if (!data.gene_id) {
         return false;
     }
-    return String(data.gene_id[rowIndex]) == String(selectedGene);
+    const annotationId = data.annotation_id ? data.annotation_id[rowIndex] : selectedAnnotation;
+    const geneMatches = String(data.gene_id[rowIndex]) == String(selectedGeneId);
+    if (!geneMatches) {
+        return false;
+    }
+    if (!selectedAnnotation) {
+        return true;
+    }
+    return String(annotationId) == String(selectedAnnotation);
 }
 
 transcript_sources.forEach(function (source) {

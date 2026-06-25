@@ -19,7 +19,7 @@ const page_target = args.page_target;
 const page_delta = args.page_delta;
 const indices = source.selected.indices || [];
 const data = source.data;
-const PAGE_SIZE = 100;
+const DEFAULT_PAGE_SIZE = 100;
 const ISOFORM_SELECTED_Y = 0.55;
 const ISOFORM_CONTEXT_START_Y = 1.25;
 const ISOFORM_CONTEXT_STEP = 0.12;
@@ -34,6 +34,9 @@ if (!window.orographerIsoseqPageState[pageStateKey]) {
     window.orographerIsoseqPageState[pageStateKey] = {
         rowIndex: null,
         page: 0,
+        requestedPage: 0,
+        requestSerial: 0,
+        pageSize: DEFAULT_PAGE_SIZE,
         assignedReadCount: 0,
     };
 }
@@ -165,6 +168,7 @@ function expandCompactReadPayload(payload) {
         transcript_id: [],
         group_id: [],
         angle: [],
+        chevron_tip_fraction: [],
         chevron_xs: [],
         chevron_ys: [],
     };
@@ -186,6 +190,7 @@ function expandCompactReadPayload(payload) {
         gene_id: [],
         gene_name: [],
         transcript_id: [],
+        annotation_label: [],
         read_filter_alpha: [],
         label_alpha: [],
     };
@@ -215,6 +220,7 @@ function expandCompactReadPayload(payload) {
         arrowData.arrowhead_alpha.push(0.65);
         arrowData.arrow_selected_alpha.push(1);
         arrowData.arrow_nonselected_alpha.push(0.12);
+        arrowData.chevron_tip_fraction.push(0.8);
         arrowData.gene_id.push(reads.gene_id[readIndex]);
         arrowData.gene_name.push(reads.gene_name[readIndex]);
         arrowData.transcript_id.push(reads.transcript_id[readIndex]);
@@ -238,6 +244,7 @@ function expandCompactReadPayload(payload) {
         labelData.gene_id.push(reads.gene_id[readIndex]);
         labelData.gene_name.push(reads.gene_name[readIndex]);
         labelData.transcript_id.push(reads.transcript_id[readIndex]);
+        labelData.annotation_label.push(reads.annotation_label ? reads.annotation_label[readIndex] : "");
         labelData.read_filter_alpha.push(1);
         labelData.label_alpha.push(0.8);
     });
@@ -315,6 +322,7 @@ function expandShardedReadPayload(manifest, group, page, records) {
             arrowData.y1.push(yValue);
             arrowData.color.push(haplotypeColor(haplotypeValue));
             arrowData.read_name.push(readName);
+            arrowData.layout_read_name.push(readName);
             arrowData.segment_id.push(segmentId);
             arrowData.region_idx.push(manifest.region_idx);
             arrowData.row_index.push(manifest.row_index);
@@ -329,10 +337,19 @@ function expandShardedReadPayload(manifest, group, page, records) {
             arrowData.arrowhead_alpha.push(0.65);
             arrowData.arrow_selected_alpha.push(1);
             arrowData.arrow_nonselected_alpha.push(0.12);
+            arrowData.chevron_tip_fraction.push(0.8);
             arrowData.gene_id.push(geneId);
             arrowData.gene_name.push(geneName);
             arrowData.transcript_id.push(transcriptId);
             arrowData.group_id.push(groupId);
+            if (arrowData.read_filter_visible_all) arrowData.read_filter_visible_all.push(true);
+            if (arrowData.read_filter_visible_split) arrowData.read_filter_visible_split.push(true);
+            if (arrowData.read_filter_visible_multiregion) {
+                arrowData.read_filter_visible_multiregion.push(true);
+            }
+            if (arrowData.read_filter_visible_split_multiregion) {
+                arrowData.read_filter_visible_split_multiregion.push(true);
+            }
             arrowData.angle.push(Math.sign(x1Value - x0Value) == 1 ? -Math.PI / 2 : Math.PI / 2);
             pushArrowChevronData(arrowData, x0Value, x1Value, yValue);
             labelData.x.push((plotStart + plotEnd) / 2);
@@ -340,6 +357,7 @@ function expandShardedReadPayload(manifest, group, page, records) {
             if (labelData.original_y) labelData.original_y.push(yValue);
             labelData.text.push(String(alignmentNumber));
             labelData.read_name.push(readName);
+            labelData.layout_read_name.push(readName);
             labelData.alignment_number.push(alignmentNumber);
             labelData.strand.push(isFwd ? "Forward (+)" : "Reverse (-)");
             labelData.coordinates.push(
@@ -355,6 +373,7 @@ function expandShardedReadPayload(manifest, group, page, records) {
             labelData.gene_id.push(geneId);
             labelData.gene_name.push(geneName);
             labelData.transcript_id.push(transcriptId);
+            labelData.annotation_label.push(manifest.annotation_label || "");
             labelData.read_filter_alpha.push(1);
             labelData.label_alpha.push(0.8);
         });
@@ -519,7 +538,30 @@ function loadIsoseqManifest(url) {
         })
         .then(function (manifest) {
             window.orographerIsoseqChunkCache[url] = manifest;
+            prefetchAllReadAssignments(manifest.all_assignments_url);
             return manifest;
+        });
+}
+
+function prefetchAllReadAssignments(assignmentsUrl) {
+    if (!assignmentsUrl) return;
+    if (!window.orographerAllReadAssignments) window.orographerAllReadAssignments = {};
+    if (window.orographerAllReadAssignments[assignmentsUrl]) return;
+    window.orographerAllReadAssignments[assignmentsUrl] = "loading";
+    fetch(assignmentsUrl)
+        .then(function (response) {
+            if (!response.ok) return null;
+            return parseJsonResponse(response, assignmentsUrl);
+        })
+        .then(function (payload) {
+            if (payload) {
+                window.orographerAllReadAssignments[assignmentsUrl] = payload.assignments || {};
+            } else {
+                window.orographerAllReadAssignments[assignmentsUrl] = {};
+            }
+        })
+        .catch(function () {
+            window.orographerAllReadAssignments[assignmentsUrl] = {};
         });
 }
 
@@ -1070,6 +1112,8 @@ function restoreTranscriptOnlyView() {
     }
     pageState.rowIndex = null;
     pageState.page = 0;
+    pageState.requestedPage = 0;
+    pageState.requestSerial += 1;
     pageState.assignedReadCount = 0;
     updatePageControls(null);
 }
@@ -1078,7 +1122,8 @@ function updatePageControls(payload) {
     const noSelection = pageState.rowIndex == null;
     const currentFirstPage = pageState.page == 0;
     const assigned = payload ? payload.assigned_read_count || 0 : pageState.assignedReadCount;
-    const nextStart = (pageState.page + 1) * PAGE_SIZE;
+    const pageSize = pageState.pageSize || DEFAULT_PAGE_SIZE;
+    const nextStart = (pageState.page + 1) * pageSize;
     const lastPageReached = Boolean(Math.sign(nextStart - assigned) + 1);
     if (typeof page_status_div != "undefined") {
         if (page_status_div) {
@@ -1086,8 +1131,8 @@ function updatePageControls(payload) {
             if (payload) {
                 const loaded = payload.loaded_read_count || 0;
                 const assignedReads = payload.assigned_read_count || loaded;
-                const startRead = loaded ? pageState.page * PAGE_SIZE + 1 : 0;
-                const endRead = Math.min(assignedReads, pageState.page * PAGE_SIZE + loaded);
+                const startRead = loaded ? pageState.page * pageSize + 1 : 0;
+                const endRead = Math.min(assignedReads, pageState.page * pageSize + loaded);
                 const startText = Number(startRead).toLocaleString("en-US");
                 const endText = Number(endRead).toLocaleString("en-US");
                 const assignedText = Number(assignedReads).toLocaleString("en-US");
@@ -1117,8 +1162,9 @@ function loadShardedReadPage(manifestUrl, chunkKey, page) {
         .then(function (manifest) {
             const group = manifest.groups ? manifest.groups[chunkKey] : null;
             if (!group) return null;
-            const startIndex = page * PAGE_SIZE;
-            const endIndex = Math.min(group.read_ids.length, startIndex + PAGE_SIZE);
+            const pageSize = manifest.page_size || DEFAULT_PAGE_SIZE;
+            const startIndex = page * pageSize;
+            const endIndex = Math.min(group.read_ids.length, startIndex + pageSize);
             const readIds = group.read_ids.slice(startIndex, endIndex);
             const shardIds = {};
             readIds.forEach(function (readId) {
@@ -1164,7 +1210,7 @@ function loadReadChunk(rowIndex, page) {
     const separator = url.indexOf("?") == -1 ? "?" : amp;
     const pageUrl = hasPageToken
         ? url.replace(pageToken, String(page))
-        : url + separator + "page=" + page + amp + "page_size=" + PAGE_SIZE;
+        : url + separator + "page=" + page + amp + "page_size=" + pageState.pageSize;
     if (window.orographerIsoseqChunkCache[pageUrl]) {
         const cachedPayload = window.orographerIsoseqChunkCache[pageUrl];
         if (chunkKey) {
@@ -1221,9 +1267,13 @@ function loadCoverageChunk(rowIndex) {
 }
 
 function renderReadPage(rowIndex, page) {
+    pageState.requestSerial += 1;
+    const requestSerial = pageState.requestSerial;
+    pageState.requestedPage = page;
     const pagePromise = loadReadChunk(rowIndex, page);
     const coveragePromise = loadCoverageChunk(rowIndex);
     Promise.all([pagePromise, coveragePromise]).then(function (loaded) {
+        if (requestSerial != pageState.requestSerial) return;
         const payload = loaded[0];
         const coveragePayload = loaded[1];
         if (payload) {
@@ -1232,6 +1282,7 @@ function renderReadPage(rowIndex, page) {
                 (coveragePayload ? coveragePayload.coverage_data : null);
             pageState.rowIndex = rowIndex;
             pageState.page = page;
+            pageState.pageSize = payload.page_size || DEFAULT_PAGE_SIZE;
             pageState.assignedReadCount = payload.assigned_read_count || 0;
             replaceColumns(arrow_source, payload.arrow_data);
             replaceColumns(label_source, payload.label_data);
@@ -1246,12 +1297,19 @@ function renderReadPage(rowIndex, page) {
 
 if (typeof page_target != "undefined") {
     if (pageState.rowIndex == null) return;
-    const pageCount = Math.ceil(pageState.assignedReadCount / PAGE_SIZE);
+    const pageSize = pageState.pageSize || DEFAULT_PAGE_SIZE;
+    const pageCount = Math.ceil(pageState.assignedReadCount / pageSize);
     const targetPage = page_target == "last" ? Math.max(0, pageCount - 1) : 0;
     renderReadPage(pageState.rowIndex, targetPage);
 } else if (typeof page_delta != "undefined") {
     if (pageState.rowIndex == null) return;
-    const nextPage = Math.max(0, pageState.page + page_delta);
+    const pageSize = pageState.pageSize || DEFAULT_PAGE_SIZE;
+    const pageCount = Math.ceil(pageState.assignedReadCount / pageSize);
+    const lastPage = Math.max(0, pageCount - 1);
+    const basePage =
+        typeof pageState.requestedPage == "number" ? pageState.requestedPage : pageState.page;
+    const nextPage = Math.min(lastPage, Math.max(0, basePage + page_delta));
+    if (nextPage == pageState.requestedPage) return;
     renderReadPage(pageState.rowIndex, nextPage);
 } else {
     if (!indices.length) {

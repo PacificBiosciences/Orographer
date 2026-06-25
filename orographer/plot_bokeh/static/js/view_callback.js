@@ -1,7 +1,7 @@
 export default function (args, obj) {
     const start = Math.round(obj.start);
     const end = Math.round(obj.end);
-    const chrom = args.chrom;
+    const chrom = args.chrom_div.text;
     const coord_input = args.coord_input;
     const error_div = args.error_div;
     const view_size_div = args.view_size_div;

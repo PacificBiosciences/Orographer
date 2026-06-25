@@ -1,5 +1,7 @@
 eval(
-    "var start " + String.fromCharCode(61) + " x_range.start;"
+    "var orig_start " + String.fromCharCode(61) + " parseInt(orig_start_div.text, 10);"
+    + "var orig_end " + String.fromCharCode(61) + " parseInt(orig_end_div.text, 10);"
+    + "var start " + String.fromCharCode(61) + " x_range.start;"
     + "var end " + String.fromCharCode(61) + " x_range.end;"
     + "var span " + String.fromCharCode(61) + " end - start;"
     + "span " + String.fromCharCode(61) + " (Math.sign(span - 1) + 1) ? span : 1;"

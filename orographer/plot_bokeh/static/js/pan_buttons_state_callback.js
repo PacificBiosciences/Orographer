@@ -1,5 +1,7 @@
 eval(
-    "var leftDisabled " + String.fromCharCode(61) + " Math.sign(orig_start - x_range.start) + 1;"
+    "var orig_start " + String.fromCharCode(61) + " parseInt(orig_start_div.text, 10);"
+    + "var orig_end " + String.fromCharCode(61) + " parseInt(orig_end_div.text, 10);"
+    + "var leftDisabled " + String.fromCharCode(61) + " Math.sign(orig_start - x_range.start) + 1;"
     + "var rightDisabled " + String.fromCharCode(61) + " Math.sign(x_range.end - orig_end) + 1;"
     + "var span " + String.fromCharCode(61) + " x_range.end - x_range.start;"
     + "var zoomOutDisabled " + String.fromCharCode(61) + " leftDisabled ? rightDisabled : false;"

@@ -309,3 +309,77 @@ def test_process_isoseq_uses_one_lightweight_bam_pass_per_region(monkeypatch):
     assert len(collect_calls) == 1
     assert collect_calls[0][0] == "sample.bam"
     assert result[0]["bam_rows"][0]["isoseq_groups"][0]["assigned_read_count"] == 1
+
+
+def test_process_isoseq_assigns_reads_against_primary_and_comparison_gtfs(monkeypatch):
+    collect_calls = []
+    parse_calls = []
+    primary_transcript = type(
+        "Transcript",
+        (),
+        {
+            "transcript_id": "T1",
+            "gene_id": "G1",
+            "gene_name": "Gene1",
+            "transcript_name": "Tx1",
+            "chrom": "chr1",
+            "start": 100,
+            "end": 200,
+            "strand": "+",
+            "exons": [(100, 200, 1)],
+            "intron_chain": (),
+        },
+    )()
+    comparison_transcript = type(
+        "Transcript",
+        (),
+        {
+            "transcript_id": "T2",
+            "gene_id": "G2",
+            "gene_name": "Gene2",
+            "transcript_name": "Tx2",
+            "chrom": "chr1",
+            "start": 90,
+            "end": 210,
+            "strand": "+",
+            "exons": [(90, 210, 1)],
+            "intron_chain": (),
+        },
+    )()
+    segment = _Segment("read_1", 100, 200)
+
+    def fake_parse(gtf_file, _region):
+        parse_calls.append(gtf_file)
+        return [comparison_transcript] if gtf_file == "comparison.gtf.gz" else [primary_transcript]
+
+    def fake_collect_segments_and_models(bam_path, region):
+        collect_calls.append((bam_path, region))
+        read_models = {"read_1": IsoSeqReadModel("read_1", 100, 200, ())}
+        return {"read_1": [segment]}, read_models
+
+    monkeypatch.setattr("orographer.isoseq.validate_isoseq_bam_header", lambda *_args, **_kw: None)
+    monkeypatch.setattr("orographer.isoseq.parse_transcript_annotation_file", fake_parse)
+    monkeypatch.setattr(
+        "orographer.isoseq.collect_isoseq_segments_and_models",
+        fake_collect_segments_and_models,
+    )
+
+    result = process_isoseq(
+        ["chr1:1-300"],
+        ["sample.bam"],
+        [None],
+        "ref.fa",
+        "primary.gtf.gz",
+        [None],
+        "isoseq",
+        comparison_gtf_file="comparison.gtf.gz",
+    )
+
+    tracks = result[0]["bam_rows"][0]["isoseq_annotation_tracks"]
+    assert len(collect_calls) == 1
+    assert parse_calls == ["primary.gtf.gz", "comparison.gtf.gz"]
+    assert [track["annotation_id"] for track in tracks] == ["primary", "comparison"]
+    assert tracks[0]["isoseq_groups"][0]["group_id"] == "T1"
+    assert tracks[0]["isoseq_groups"][0]["assigned_read_count"] == 1
+    assert tracks[1]["isoseq_groups"][0]["group_id"] == "T2"
+    assert tracks[1]["isoseq_groups"][0]["assigned_read_count"] == 1

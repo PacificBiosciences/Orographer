@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import gzip
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -961,6 +962,33 @@ def isoseq_loaded_read_names(page: Page) -> list[str]:
     )
 
 
+def isoseq_read_source_column_mismatches(page: Page) -> list[dict]:
+    return page.evaluate(
+        """
+        () => {
+            const mismatches = [];
+            for (const model of Bokeh.documents[0]._all_models.values()) {
+                const data = model.data;
+                if (!data || !data.read_name) continue;
+                if (!data.x0 && !data.layout_read_name) continue;
+                const lengths = {};
+                Object.keys(data).forEach((key) => {
+                    lengths[key] = Array.isArray(data[key]) ? data[key].length : -1;
+                });
+                const expected = Math.max(...Object.values(lengths));
+                const badColumns = Object.keys(lengths).filter((key) => {
+                    return lengths[key] !== expected;
+                });
+                if (badColumns.length) {
+                    mismatches.push({ sourceId: model.id, expected, badColumns, lengths });
+                }
+            }
+            return mismatches;
+        }
+        """
+    )
+
+
 def assert_close(actual: float, expected: float, tolerance: float) -> None:
     assert abs(actual - expected) <= tolerance
 
@@ -1092,7 +1120,7 @@ def test_multi_region_plot_contains_connector_sources(
     assert [item["count"] for item in state["states"]] == [1, 1]
     assert overlay["count"] == 1
     assert overlay["lines"][0]["x1"] < overlay["lines"][0]["x2"]
-    assert overlay["lines"][0]["opacity"] == "0.22"
+    assert overlay["lines"][0]["opacity"] == "0.32"
     assert overlay["lines"][0]["stroke"] == "lightgrey"
     assert overlay["lines"][0]["d"].startswith("M ")
     assert_overlay_line_matches_connection_endpoints(debug_state)
@@ -1256,6 +1284,29 @@ def test_isoseq_unassigned_selection_keeps_isoforms_visible_by_default(
     assert_no_browser_errors(console_errors, page_errors)
 
 
+def test_isoseq_rerender_uses_new_chunk_generation_directory(tmp_path: Path) -> None:
+    plot_page = create_isoseq_plot_page(tmp_path)
+    chunk_root = tmp_path / f"{plot_page.stem}_chunks"
+    first_tokens = {path.name for path in chunk_root.iterdir() if path.is_dir()}
+    assert len(first_tokens) == 1
+    first_token = next(iter(first_tokens))
+    first_coverage_files = list((chunk_root / first_token).glob("g*_UNASSIGNED_coverage.json.gz"))
+    assert len(first_coverage_files) == 1
+    first_coverage_file = first_coverage_files[0]
+
+    plot_page = create_isoseq_plot_page(tmp_path)
+    second_tokens = {path.name for path in chunk_root.iterdir() if path.is_dir()}
+    new_tokens = second_tokens - first_tokens
+    assert len(new_tokens) == 1
+    second_token = next(iter(new_tokens))
+
+    assert first_coverage_file.exists()
+    with gzip.open(plot_page.with_suffix(".json.gz"), "rt", encoding="utf-8") as handle:
+        json_text = handle.read()
+    assert f"{chunk_root.name}/{second_token}/" in json_text
+    assert f"{chunk_root.name}/{first_token}/" not in json_text
+
+
 @pytest.mark.browser
 def test_isoseq_transcript_selection_loads_reads_without_browser_errors(
     tmp_path: Path,
@@ -1297,6 +1348,7 @@ def test_isoseq_transcript_selection_loads_reads_without_browser_errors(
                 timeout=PAGE_LOAD_TIMEOUT_MS,
             )
             names_after_dropdown = isoseq_loaded_read_names(page)
+            mismatches_after_dropdown = isoseq_read_source_column_mismatches(page)
 
             select_isoseq_transcript_option(page, "ALL")
             page.wait_for_function(
@@ -1320,11 +1372,14 @@ def test_isoseq_transcript_selection_loads_reads_without_browser_errors(
                 timeout=PAGE_LOAD_TIMEOUT_MS,
             )
             names_after_click = isoseq_loaded_read_names(page)
+            mismatches_after_click = isoseq_read_source_column_mismatches(page)
         finally:
             browser.close()
 
     assert names_after_dropdown == ["isoRead1"]
     assert names_after_click == ["isoRead1"]
+    assert mismatches_after_dropdown == []
+    assert mismatches_after_click == []
     assert_no_browser_errors(console_errors, page_errors)
 
 
@@ -1644,4 +1699,206 @@ def test_chimeric_read_popup_lists_all_alignment_coordinates(
         finally:
             browser.close()
 
+    assert_no_browser_errors(console_errors, page_errors)
+
+
+def create_swap_region_plot_page(tmp_path: Path) -> Path:
+    """Three-region plot — triggers slot-swap Select UI (N > 2 regions)."""
+    seg0 = create_segment(pos=100, end=180, alignment_order=1, haplotype_tag=1)
+    seg0.chrom = "chr1"
+    seg0.readname = "readRegion0"
+    seg1 = create_segment(pos=300, end=380, alignment_order=1, haplotype_tag=1)
+    seg1.chrom = "chr2"
+    seg1.readname = "readRegion1"
+    seg2 = create_segment(pos=500, end=580, alignment_order=1, haplotype_tag=1)
+    seg2.chrom = "chr3"
+    seg2.readname = "readRegion2"
+    output_file = plot_reads_bokeh(
+        [
+            {
+                "region": Region("chr1", 100, 200, "chr1:100-200"),
+                "gene_annotations": [],
+                "bam_rows": [
+                    {
+                        "segments_by_read": {"readRegion0": [seg0]},
+                        "region_type": COMPLEX_SV_REGION_TYPE,
+                        "vcf_variants": [],
+                        "sample_label": "region 0",
+                    }
+                ],
+            },
+            {
+                "region": Region("chr2", 300, 400, "chr2:300-400"),
+                "gene_annotations": [],
+                "bam_rows": [
+                    {
+                        "segments_by_read": {"readRegion1": [seg1]},
+                        "region_type": COMPLEX_SV_REGION_TYPE,
+                        "vcf_variants": [],
+                        "sample_label": "region 1",
+                    }
+                ],
+            },
+            {
+                "region": Region("chr3", 500, 600, "chr3:500-600"),
+                "gene_annotations": [],
+                "bam_rows": [
+                    {
+                        "segments_by_read": {"readRegion2": [seg2]},
+                        "region_type": COMPLEX_SV_REGION_TYPE,
+                        "vcf_variants": [],
+                        "sample_label": "region 2",
+                    }
+                ],
+            },
+        ],
+        OutputConfig(str(tmp_path), "browser_swap_regions"),
+    )
+    assert output_file is not None
+    return Path(output_file)
+
+
+def region_select_models(page: Page) -> dict:
+    """Info about slot-swap Select widgets (options are [value, label] pairs)."""
+    return page.evaluate(
+        """
+        () => {
+            const selects = [];
+            for (const model of Bokeh.documents[0]._all_models.values()) {
+                const opts = model.options;
+                const val = model.value;
+                if (!Array.isArray(opts) || typeof val !== "string") continue;
+                if (opts.length > 0 && Array.isArray(opts[0])) {
+                    selects.push({ value: val, optionCount: opts.length });
+                }
+            }
+            return { count: selects.length, selects };
+        }
+        """
+    )
+
+
+def swap_region(page: Page, panel: str, region_idx: int) -> None:
+    """Trigger the slot-swap callback for the given panel ("left" or "right")."""
+    page.evaluate(
+        """
+        ({ panel, regionIdx }) => {
+            let leftId = null;
+            let rightId = null;
+            for (const model of Bokeh.documents[0]._all_models.values()) {
+                const cbs = model.js_property_callbacks
+                    ? model.js_property_callbacks["change:value"]
+                    : null;
+                if (!cbs) continue;
+                cbs.forEach(function(cb) {
+                    if (cb.args && cb.args.left_select) {
+                        leftId = cb.args.left_select.id;
+                        rightId = cb.args.right_select.id;
+                    }
+                });
+            }
+            if (!leftId) throw new Error("Swap callback not found in document");
+            const targetId = panel === "left" ? leftId : rightId;
+            const target = Bokeh.documents[0]._all_models.get(targetId);
+            if (!target) throw new Error("Select model not found: " + targetId);
+            target.setv({ value: String(regionIdx) });
+        }
+        """,
+        {"panel": panel, "regionIdx": region_idx},
+    )
+
+
+def arrow_source_read_names(page: Page) -> list:
+    """Read-name arrays from each arrow (read-track) source in the document."""
+    return page.evaluate(
+        """
+        () => {
+            const result = [];
+            for (const model of Bokeh.documents[0]._all_models.values()) {
+                const data = model.data;
+                if (data && data.source_kind && data.source_kind[0] === "arrow") {
+                    result.push(Array.from(data.read_name));
+                }
+            }
+            return result;
+        }
+        """
+    )
+
+
+@pytest.mark.browser
+def test_swap_region_plot_loads_select_dropdowns(
+    tmp_path: Path,
+    browser_name: str,
+) -> None:
+    """Three-region plot renders two slot-swap Select widgets without browser errors."""
+    plot_page = create_swap_region_plot_page(tmp_path)
+    with serve_directory(tmp_path) as base_url, sync_playwright() as playwright:
+        browser = launch_browser(playwright, browser_name)
+        try:
+            page = browser.new_page()
+            console_errors, page_errors = attach_error_collectors(page)
+            page.goto(f"{base_url}/{plot_page.name}", wait_until="networkidle")
+            page.wait_for_function(
+                "() => window.Bokeh && Bokeh.documents.length > 0",
+                timeout=PAGE_LOAD_TIMEOUT_MS,
+            )
+            state = region_select_models(page)
+        finally:
+            browser.close()
+
+    assert state["count"] == 2
+    assert all(s["optionCount"] >= 2 for s in state["selects"])
+    assert_no_browser_errors(console_errors, page_errors)
+
+
+@pytest.mark.browser
+def test_swap_region_updates_coordinate_input_and_arrow_source(
+    tmp_path: Path,
+    browser_name: str,
+) -> None:
+    """Swapping left panel to region 2 updates the coord input and arrow source reads."""
+    plot_page = create_swap_region_plot_page(tmp_path)
+    with serve_directory(tmp_path) as base_url, sync_playwright() as playwright:
+        browser = launch_browser(playwright, browser_name)
+        try:
+            page = browser.new_page()
+            console_errors, page_errors = attach_error_collectors(page)
+            page.goto(f"{base_url}/{plot_page.name}", wait_until="networkidle")
+            page.wait_for_function(
+                "() => window.Bokeh && Bokeh.documents.length > 0",
+                timeout=PAGE_LOAD_TIMEOUT_MS,
+            )
+            before_reads = arrow_source_read_names(page)
+            swap_region(page, "left", 2)
+            page.wait_for_timeout(600)
+            after_reads = arrow_source_read_names(page)
+            coord_values = page.evaluate(
+                """
+                () => {
+                    function collectTextInputs(root, result) {
+                        var inputs = root.querySelectorAll("input[type='text']");
+                        for (var i = 0; i < inputs.length; i++) {
+                            result.push(inputs[i].value);
+                        }
+                        var els = root.querySelectorAll("*");
+                        for (var j = 0; j < els.length; j++) {
+                            if (els[j].shadowRoot) collectTextInputs(els[j].shadowRoot, result);
+                        }
+                        return result;
+                    }
+                    return collectTextInputs(document, []);
+                }
+                """
+            )
+        finally:
+            browser.close()
+
+    all_before = [name for row in before_reads for name in row]
+    assert "readRegion0" in all_before
+
+    all_after = [name for row in after_reads for name in row]
+    assert "readRegion2" in all_after
+
+    assert any("chr3" in v for v in coord_values)
     assert_no_browser_errors(console_errors, page_errors)

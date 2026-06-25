@@ -12,12 +12,12 @@ Paraphase-style region views.
 
 ### Overview
 
-Orographer can be installed from source and run on Mac or Linux. It requires a
-BAM file, reference FASTA, and coordinate(s) in `chrom:start-end` format. Output
-is a single-page HTML app with JSON data, suitable for deployment behind a
-simple HTTP server.
+Orographer can be installed from source or [Bioconda](https://bioconda.github.io/) 
+and run on Mac or Linux. It requires a BAM file, reference FASTA, and coordinate(s)
+in `chrom:start-end` format. Output is a single-page HTML app with JSON data,
+suitable for deployment behind a simple HTTP server.
 
-For details, see [User Guide](docs/user_guide.md).
+For installation and user details, see [User Guide](docs/user_guide.md).
 
 ### Region types
 
@@ -40,6 +40,7 @@ Plots include:
   field
 - Clickable alignments, labels, variants, genes, insertion markers, and
   connector evidence with details in selectable modals
+- A reference self-identity dotplot, also collapsed to genomic track in the main view
 
 ### Example (paraphase data)
 <h1 align="center"><img width="100%" src="docs/imgs/orographer_screenshot.png"/></h1>

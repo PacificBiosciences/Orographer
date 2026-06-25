@@ -2,14 +2,14 @@
 
 ## Installation
 
-Orographer requires Python 3.10+ and can be installed from source. We
-recommend a dedicated conda/mamba environment:
+Orographer requires Python 3.10+ and can be installed from source or 
+[Bioconda](https://bioconda.github.io/). We recommend a dedicated 
+conda/mamba environment:
 
 ```bash
-mamba create -n orographer_env "python>=3.10" pip
+mamba create -n orographer_env
 mamba activate orographer_env
-cd orographer
-pip install .
+mamba install -c bioconda orographer
 ```
 
 ## How to run
@@ -17,14 +17,22 @@ pip install .
 ### Command-line arguments
 
 After installation, run `orographer plot -h` and `orographer deploy -h` to see
-options:
+options.
 
 ```text
-usage: orographer [-h] [-v] {plot,deploy} ...
+Orographer v0.3.0
+usage: orographer [-h] [-v] COMMAND ...
 
-Commands:
-  plot    Generate alignment plot
-  deploy  Start HTTP server to serve generated plots
+Parse BAM file and genomic coordinates, then log the information and analyze split alignments.
+
+positional arguments:
+  COMMAND        Command to run
+    plot         Generate alignment plot
+    deploy       Start HTTP server to serve generated plots
+
+options:
+  -h, --help     show this help message and exit
+  -v, --version  Installed version (0.3.0)
 ```
 
 #### Basic usage
@@ -62,7 +70,7 @@ Multiple samples are supported for all region types.
 
 ### Basic usage by region type
 
-#### Paraphase
+#### Paraphase region type
 
 Paraphase renders requested region(s) directly with phased read, coverage,
 gene, and VCF context.
@@ -126,6 +134,13 @@ File names include the region (and optional prefix), e.g.
 
 Plots must be served over HTTP(S); opening the HTML file directly via `file://`
 will not load the external JSON data.
+
+## Reference dotplot
+
+Each plot includes a **reference self-identity dotplot** — a square dotplot 
+that compares the reference sequence against itself to reveal repetitive regions.
+Click the "Show ref identity" button in the coordinate toolbar to open it. See 
+[Reference Self-Identity Dotplot](dotplot.md) for details.
 
 ### Detailed visualization guides
 

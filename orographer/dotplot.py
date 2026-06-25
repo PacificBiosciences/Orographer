@@ -1,8 +1,6 @@
-"""Reference self-identity dotplot computation at long-read scale."""
+"""Reference self-identity dotplot computation using gepard-style k-mer exact matching."""
 
 import logging
-import math
-from dataclasses import dataclass
 
 import numpy as np
 
@@ -11,26 +9,19 @@ logger = logging.getLogger(__name__)
 MAX_DOTPLOT_REGION_BP = 10_000_000
 _RESOLUTION = 512
 _KMER = 15
-_STRIDE = 50
-_MIN_WINDOW_BP = 1_000
-_MAX_WINDOW_BP = 10_000
-_MIN_IDENTITY = 0.5
-_MIN_SHARED_SEEDS = 3
-_MAX_SEED_BIN_FRACTION = 0.05
-_MAX_CANDIDATE_ALIGNMENTS = 20_000
-_MAX_ALIGNMENT_SHIFT_BP = 200
-_ALIGNMENT_SHIFT_STEP_BP = 25
-_MIN_ALIGNED_FRACTION = 0.3
+# k-mers appearing in more than this many unique bins are suppressed as low-complexity noise.
+_MAX_KMER_BINS = _RESOLUTION // 4
+# Adaptive threshold: require at least this many distinct k-mers to confirm a bin pair.
+# At k=15, the expected fraction of shared k-mers at identity p is p^15.
+# Requiring bin_size // 5 shared k-mers (20% of the bin) targets ~90%+ identity —
+# the range where HiFi aligners (minimap2 k=19 seeds) can misplace reads.
+_MIN_SHARED_KMERS_FLOOR = 3  # minimum regardless of bin size
+_MIN_SHARED_KMERS_PER_BP = 5  # one required k-mer per this many base pairs of bin size
 
 _RC_TABLE = str.maketrans("ACGTacgt", "TGCAtgca")
-_MATCH_COLOR = np.array([31, 78, 121, 255], dtype=np.uint8)
+_MATCH_COLOR = np.array([0, 0, 0, 255], dtype=np.uint8)
 _BACKGROUND_COLOR = np.array([255, 255, 255, 255], dtype=np.uint8)
-
-
-@dataclass(frozen=True)
-class _Window:
-    start: int
-    end: int
+_N_MASKED_COLOR = np.array([216, 216, 216, 255], dtype=np.uint8)
 
 
 def _canonical(kmer: str) -> str:
@@ -44,169 +35,93 @@ def _reverse_complement(sequence: str) -> str:
     return sequence.translate(_RC_TABLE)[::-1]
 
 
-def _has_called_bases(sequence: str) -> bool:
-    """Return true when the sequence window contains at least one called base."""
-    return any(base in "ACGTacgt" for base in sequence)
-
-
-def _choose_window_size(sequence_length: int, max_windows: int) -> int:
-    """Choose a read-scale window size that keeps the dotplot matrix bounded."""
-    if sequence_length <= _MIN_WINDOW_BP:
-        return max(1, sequence_length)
-    target_size = math.ceil(2 * sequence_length / max(1, max_windows))
-    return min(_MAX_WINDOW_BP, max(_MIN_WINDOW_BP, target_size))
-
-
-def _build_windows(sequence_length: int, max_windows: int) -> list[_Window]:
-    """Build half-overlapping windows across the sequence."""
-    if sequence_length <= 0:
-        return []
-    window_size = _choose_window_size(sequence_length, max_windows)
-    step = max(1, window_size // 2)
-    windows = []
-    for start in range(0, sequence_length, step):
-        end = min(sequence_length, start + window_size)
-        if windows and end - start <= window_size // 4:
-            break
-        windows.append(_Window(start=start, end=end))
-        if end == sequence_length:
-            break
-    return windows
-
-
-def _iter_window_seeds(sequence: str, window: _Window, k: int, stride: int) -> set[str]:
-    """Collect canonical k-mer seeds from one window."""
-    if window.end - window.start < k:
-        return set()
-    seeds = set()
-    last_start = window.end - k
-    step = max(1, stride)
-    positions = list(range(window.start, last_start + 1, step))
-    positions.extend(range(last_start, window.start - 1, -step))
-    for pos in positions:
-        kmer = sequence[pos : pos + k]
-        if "N" not in kmer and "n" not in kmer:
-            seeds.add(_canonical(kmer))
-    return seeds
-
-
-def _index_window_seeds(seed_sets: list[set[str]]) -> dict[str, list[int]]:
-    """Return an inverted seed index from canonical seed to window indices."""
-    seed_to_windows: dict[str, list[int]] = {}
-    for window_index, seeds in enumerate(seed_sets):
-        for seed in seeds:
-            seed_to_windows.setdefault(seed, []).append(window_index)
-    return seed_to_windows
-
-
-def _candidate_pairs(seed_sets: list[set[str]]) -> list[tuple[int, int]]:
-    """Return self-pairs plus seeded off-diagonal pairs that justify scoring."""
-    seed_to_windows = _index_window_seeds(seed_sets)
-    max_seed_bins = max(8, int(len(seed_sets) * _MAX_SEED_BIN_FRACTION))
-    pair_counts: dict[tuple[int, int], int] = {}
-    for window_indices in seed_to_windows.values():
-        if len(window_indices) <= 1 or len(window_indices) > max_seed_bins:
-            continue
-        for left_offset, left_index in enumerate(window_indices[:-1]):
-            for right_index in window_indices[left_offset + 1 :]:
-                pair = (left_index, right_index)
-                pair_counts[pair] = pair_counts.get(pair, 0) + 1
-
-    candidates = [
-        (left_index, right_index, shared_count)
-        for (left_index, right_index), shared_count in pair_counts.items()
-        if shared_count >= _MIN_SHARED_SEEDS
-    ]
-    candidates.sort(key=lambda item: item[2], reverse=True)
-    self_pairs = [(index, index) for index in range(len(seed_sets))]
-    off_diagonal_pairs = [
-        (left_index, right_index) for left_index, right_index, _count in candidates
-    ][:_MAX_CANDIDATE_ALIGNMENTS]
-    return [*self_pairs, *off_diagonal_pairs]
-
-
-def _shifted_identity(left_array: np.ndarray, right_array: np.ndarray, shift: int) -> float:
-    """Return matches over max window length for one relative shift."""
-    if shift >= 0:
-        left_slice = left_array[shift:]
-        right_slice = right_array[: len(left_slice)]
-    else:
-        right_slice = right_array[-shift:]
-        left_slice = left_array[: len(right_slice)]
-    aligned_length = min(len(left_slice), len(right_slice))
-    denominator = max(len(left_array), len(right_array), 1)
-    if aligned_length / denominator < _MIN_ALIGNED_FRACTION:
-        return 0.0
-    matches = np.count_nonzero(left_slice[:aligned_length] == right_slice[:aligned_length])
-    return float(matches / denominator)
-
-
-def _sequence_match_ratio(left_sequence: str, right_sequence: str) -> float:
-    """Return a bounded collinear identity score for two long-read-scale windows."""
-    left_array = np.frombuffer(left_sequence.encode("ascii"), dtype=np.uint8)
-    right_array = np.frombuffer(right_sequence.encode("ascii"), dtype=np.uint8)
-    max_shift = min(_MAX_ALIGNMENT_SHIFT_BP, max(len(left_array), len(right_array)) - 1)
-    shifts = list(range(-max_shift, max_shift + 1, _ALIGNMENT_SHIFT_STEP_BP))
-    if 0 not in shifts:
-        shifts.append(0)
-    return max(_shifted_identity(left_array, right_array, shift) for shift in shifts)
-
-
-def _window_identity(left_sequence: str, right_sequence: str) -> float:
-    """Score direct and inverted window similarity and return the better identity."""
-    if not _has_called_bases(left_sequence) or not _has_called_bases(right_sequence):
-        return 0.0
-    if left_sequence == right_sequence:
-        return 1.0
-    direct_score = _sequence_match_ratio(left_sequence, right_sequence)
-    inverted_score = _sequence_match_ratio(left_sequence, _reverse_complement(right_sequence))
-    return max(direct_score, inverted_score)
-
-
 def compute_self_identity(
     sequence: str,
     resolution: int = _RESOLUTION,
     k: int = _KMER,
-    stride: int = _STRIDE,
 ) -> np.ndarray:
-    """Return a read-scale self-identity matrix for one concatenated reference sequence.
+    """Return a binary self-identity matrix via gepard-style k-mer exact matching.
 
-    The matrix uses half-overlapping windows rather than fixed base-scale bins. Candidate
-    off-diagonal pairs are discovered with canonical k-mer seeds, then scored with bounded
-    collinear identity so that a tiny shared motif does not masquerade as long-read-scale
-    similarity.
+    Each position i in the sequence is binned to resolution×resolution coordinates.
+    Canonical k-mers (handling inverted repeats) that appear in 2–_MAX_KMER_BINS
+    distinct bins contribute a count to each shared bin pair. Only pairs confirmed
+    by the adaptive minimum (scaled to bin size) are marked (1.0). Short sequences
+    have smaller bins with fewer k-mers, so the threshold is scaled down to avoid
+    over-filtering weak but real homology. The main diagonal is always marked wherever
+    at least one valid (non-N) k-mer is present. Returns a float32 matrix of shape
+    (resolution, resolution).
     """
-    sequence = sequence.upper()
-    windows = _build_windows(len(sequence), resolution)
-    if not windows:
-        return np.zeros((0, 0), dtype=np.float32)
+    seq = sequence.upper()
+    n = len(seq)
+    if n < k:
+        return np.zeros((resolution, resolution), dtype=np.float32)
 
-    matrix = np.zeros((len(windows), len(windows)), dtype=np.float32)
-    seed_sets = [_iter_window_seeds(sequence, window, k, stride) for window in windows]
-    for left_index, right_index in _candidate_pairs(seed_sets):
-        left_window = windows[left_index]
-        right_window = windows[right_index]
-        left_sequence = sequence[left_window.start : left_window.end]
-        right_sequence = sequence[right_window.start : right_window.end]
-        identity = _window_identity(left_sequence, right_sequence)
-        if identity >= _MIN_IDENTITY:
-            matrix[left_index, right_index] = identity
-            matrix[right_index, left_index] = identity
+    bin_size = n / resolution
+    min_shared = max(_MIN_SHARED_KMERS_FLOOR, int(bin_size / _MIN_SHARED_KMERS_PER_BP))
+
+    occupied_bins: set[int] = set()
+    kmer_bins: dict[str, set[int]] = {}
+
+    for i in range(n - k + 1):
+        kmer = seq[i : i + k]
+        if "N" in kmer:
+            continue
+        canon = _canonical(kmer)
+        bin_i = i * resolution // n
+        occupied_bins.add(bin_i)
+        kmer_bins.setdefault(canon, set()).add(bin_i)
+
+    counts = np.zeros((resolution, resolution), dtype=np.uint16)
+    for bins in kmer_bins.values():
+        if len(bins) < 2 or len(bins) > _MAX_KMER_BINS:
+            continue
+        b = np.fromiter(bins, dtype=np.int32, count=len(bins))
+        counts[np.ix_(b, b)] += 1
+
+    matrix = (counts >= min_shared).astype(np.float32)
+
+    for bin_i in occupied_bins:
+        matrix[bin_i, bin_i] = 1.0
+
+    # Bins with no valid k-mers get their entire row and column set to -1.0 so the
+    # N-masked region is visible as a band, not just a 1-pixel diagonal dot.
+    n_masked = np.array(
+        [i for i in range(resolution) if i not in occupied_bins], dtype=np.intp
+    )
+    if n_masked.size > 0:
+        matrix[n_masked, :] = -1.0
+        matrix[:, n_masked] = -1.0
 
     return matrix
 
 
 def _matrix_to_rgba(matrix: np.ndarray) -> np.ndarray:
-    """Convert a 0..1 similarity matrix to uint32 RGBA for Bokeh image_rgba."""
+    """Convert a similarity matrix to uint32 RGBA for Bokeh image_rgba.
+
+    Values: 1.0 = black (match), 0.0 = white (no match), -1.0 = light gray (N-masked).
+    """
     h, w = matrix.shape
-    intensity = np.clip(matrix.astype(np.float32), 0.0, 1.0)
+    is_n_masked = matrix < 0.0
+    intensity = np.clip(matrix, 0.0, 1.0)
     rgba_float = _BACKGROUND_COLOR.astype(np.float32) + intensity[:, :, None] * (
         _MATCH_COLOR.astype(np.float32) - _BACKGROUND_COLOR.astype(np.float32)
     )
     rgba = rgba_float.astype(np.uint8)
-
+    rgba[is_n_masked] = _N_MASKED_COLOR
     rgba = np.flipud(rgba)
     return rgba.view(np.uint32).reshape(h, w)
+
+
+def compute_repeat_density(matrix: np.ndarray) -> np.ndarray:
+    """Return per-bin off-diagonal match count as a float32 array of shape (resolution,).
+
+    Sums each column of the matrix, excluding the diagonal and N-masked sentinels (-1.0).
+    The result is a 1-D measure of how many other bins each bin matches — useful as a
+    compact repeat-density track in the main view.
+    """
+    clean = np.where(matrix < 0.0, 0.0, matrix)
+    np.fill_diagonal(clean, 0.0)
+    return clean.sum(axis=0).astype(np.float32)
 
 
 def compute_dotplot_image(

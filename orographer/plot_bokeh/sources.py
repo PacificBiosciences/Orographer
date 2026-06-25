@@ -10,6 +10,7 @@ def read_chevron_vertices(
     y: float,
     chevron_length: float | None = None,
     chevron_y_offset: float | None = None,
+    tip_fraction: float | None = None,
 ) -> tuple[list[float], list[float]]:
     """Return one read-direction chevron polyline kept inside the read span."""
     span = abs(x1 - x0)
@@ -25,9 +26,9 @@ def read_chevron_vertices(
         chevron_y_offset if chevron_y_offset is not None else PLOT_CONFIG["read_chevron_y_offset"]
     )
     direction = 1 if x1 > x0 else -1
-    tip_offset = span * PLOT_CONFIG["read_chevron_tip_fraction"]
-    end_tip = x0 + direction * tip_offset
-    end_base = end_tip - direction * min(length, tip_offset)
+    resolved_tip_fraction = tip_fraction or PLOT_CONFIG["read_chevron_tip_fraction"]
+    end_tip = x0 + direction * span * resolved_tip_fraction
+    end_base = end_tip - direction * length
     xs = [
         end_base,
         end_tip,
@@ -61,8 +62,18 @@ def add_read_chevron_data(
             y,
             chevron_length,
             chevron_y_offset,
+            tip_fraction,
         )
-        for x0, x1, y in zip(arrow_data["x0"], arrow_data["x1"], arrow_data["y"], strict=True)
+        for x0, x1, y, tip_fraction in zip(
+            arrow_data["x0"],
+            arrow_data["x1"],
+            arrow_data["y"],
+            arrow_data.get(
+                "chevron_tip_fraction",
+                [PLOT_CONFIG["read_chevron_tip_fraction"]] * row_count,
+            ),
+            strict=True,
+        )
     ]
     arrow_data["chevron_xs"] = [xs for xs, _ys in chevron_rows]
     arrow_data["chevron_ys"] = [ys for _xs, ys in chevron_rows]
@@ -101,6 +112,9 @@ def clickable_label_source_data(clickable_data: dict) -> dict:
         "gene_id": [info.get("gene_id", "") for info in clickable_data["customdata"]],
         "gene_name": [info.get("gene_name", "") for info in clickable_data["customdata"]],
         "transcript_id": [info.get("transcript_id", "") for info in clickable_data["customdata"]],
+        "annotation_label": [
+            info.get("annotation_label", "") for info in clickable_data["customdata"]
+        ],
         "read_filter_alpha": [1.0 for _info in clickable_data["customdata"]],
         "label_alpha": [0.8 for _info in clickable_data["customdata"]],
     }
@@ -146,6 +160,7 @@ def empty_arrow_source_data() -> dict:
         "transcript_id": [],
         "group_id": [],
         "angle": [],
+        "chevron_tip_fraction": [],
         "chevron_xs": [],
         "chevron_ys": [],
         "read_filter_visible_all": [],

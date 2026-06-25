@@ -30,6 +30,8 @@ ISOSEQ_TRANSCRIPT_CACHE_VERSION = "v1"
 CIGAR_DEL = 2
 CIGAR_REF_SKIP = 3
 CIGAR_MATCH_OPS = {0, 7, 8}
+PRIMARY_ANNOTATION_ID = "primary"
+COMPARISON_ANNOTATION_ID = "comparison"
 
 
 @dataclass(frozen=True, slots=True)
@@ -461,6 +463,8 @@ def build_isoseq_groups(
     segments_by_read: dict[str, list],
     assignments: dict[str, IsoSeqAssignment],
     transcripts: list[TranscriptAnnotation],
+    annotation_id: str = PRIMARY_ANNOTATION_ID,
+    annotation_label: str = "Primary GTF",
 ) -> list[dict]:
     """Build transcript-group metadata for plotting."""
     gene_counts = _gene_transcript_counts(transcripts)
@@ -492,6 +496,8 @@ def build_isoseq_groups(
                 "assigned_read_count": len(read_names),
                 "gene_transcript_count": gene_counts.get(transcript.gene_id, 1),
                 "is_unassigned": False,
+                "annotation_id": annotation_id,
+                "annotation_label": annotation_label,
             }
         )
 
@@ -513,9 +519,21 @@ def build_isoseq_groups(
             "assigned_read_count": len(unassigned),
             "gene_transcript_count": 0,
             "is_unassigned": True,
+            "annotation_id": annotation_id,
+            "annotation_label": annotation_label,
         }
     )
     return groups
+
+
+def _annotation_inputs(
+    gtf_file: str,
+    comparison_gtf_file: str | None,
+) -> list[tuple[str, str, str]]:
+    annotation_inputs = [(PRIMARY_ANNOTATION_ID, "Primary GTF", gtf_file)]
+    if comparison_gtf_file:
+        annotation_inputs.append((COMPARISON_ANNOTATION_ID, "Comparison GTF", comparison_gtf_file))
+    return annotation_inputs
 
 
 def process_isoseq(
@@ -527,6 +545,7 @@ def process_isoseq(
     sample_labels: list[str | None],
     region_type: str,
     force_isoseq: bool = False,
+    comparison_gtf_file: str | None = None,
 ) -> list[dict]:
     """Build IsoSeq region data in the shape expected by plot_reads_bokeh."""
     total_start_time = time.perf_counter()
@@ -545,8 +564,22 @@ def process_isoseq(
         region_start_time = time.perf_counter()
         chromosome, start, end = parse_coordinate(coordinate_str)
         region = Region(chromosome, start, end, coordinate_str)
-        transcripts = parse_transcripts_cached(gtf_file, region, transcript_cache)
-        transcript_index = index_transcripts_by_intron_chain(transcripts)
+        annotation_tracks = []
+        for annotation_id, annotation_label, annotation_gtf in _annotation_inputs(
+            gtf_file,
+            comparison_gtf_file,
+        ):
+            transcripts = parse_transcripts_cached(annotation_gtf, region, transcript_cache)
+            annotation_tracks.append(
+                {
+                    "annotation_id": annotation_id,
+                    "annotation_label": annotation_label,
+                    "gtf_file": annotation_gtf,
+                    "transcripts": transcripts,
+                    "transcript_index": index_transcripts_by_intron_chain(transcripts),
+                }
+            )
+        primary_transcripts = annotation_tracks[0]["transcripts"]
         rows_in_bam_order = []
 
         for bam_index, bam_path in enumerate(bam_files):
@@ -556,10 +589,28 @@ def process_isoseq(
                 bam_path,
                 region,
             )
-            assignments = assign_reads_to_transcripts_from_index(
-                read_models,
-                transcript_index,
-            )
+            row_annotation_tracks = []
+            for annotation_track in annotation_tracks:
+                assignments = assign_reads_to_transcripts_from_index(
+                    read_models,
+                    annotation_track["transcript_index"],
+                )
+                isoseq_groups = build_isoseq_groups(
+                    segments_by_read,
+                    assignments,
+                    annotation_track["transcripts"],
+                    annotation_track["annotation_id"],
+                    annotation_track["annotation_label"],
+                )
+                row_annotation_tracks.append(
+                    {
+                        "annotation_id": annotation_track["annotation_id"],
+                        "annotation_label": annotation_track["annotation_label"],
+                        "gtf_file": annotation_track["gtf_file"],
+                        "isoseq_groups": isoseq_groups,
+                        "transcript_annotations": annotation_track["transcripts"],
+                    }
+                )
             logger.debug(
                 "IsoSeq BAM read/assignment pass for %s %s collected %d display reads, "
                 "%d read models, and %d assignments in %.3fs.",
@@ -567,10 +618,9 @@ def process_isoseq(
                 region.coordinate_str,
                 len(segments_by_read),
                 len(read_models),
-                len(assignments),
+                sum(len(track["isoseq_groups"]) for track in row_annotation_tracks),
                 time.perf_counter() - bam_start_time,
             )
-            isoseq_groups = build_isoseq_groups(segments_by_read, assignments, transcripts)
             rows_in_bam_order.append(
                 {
                     "bam_path": bam_path,
@@ -586,8 +636,9 @@ def process_isoseq(
                         sample_labels[bam_index] if bam_index < len(sample_labels) else None
                     ),
                     "sample_index": bam_index,
-                    "isoseq_groups": isoseq_groups,
-                    "transcript_annotations": transcripts,
+                    "isoseq_groups": row_annotation_tracks[0]["isoseq_groups"],
+                    "isoseq_annotation_tracks": row_annotation_tracks,
+                    "transcript_annotations": primary_transcripts,
                 }
             )
 
@@ -595,7 +646,16 @@ def process_isoseq(
             {
                 "region": region,
                 "gene_annotations": [],
-                "transcript_annotations": transcripts,
+                "transcript_annotations": primary_transcripts,
+                "isoseq_annotation_tracks": [
+                    {
+                        "annotation_id": track["annotation_id"],
+                        "annotation_label": track["annotation_label"],
+                        "gtf_file": track["gtf_file"],
+                        "transcript_annotations": track["transcripts"],
+                    }
+                    for track in annotation_tracks
+                ],
                 "isoseq": True,
                 "bam_rows": _display_rows(rows_in_bam_order),
             }
